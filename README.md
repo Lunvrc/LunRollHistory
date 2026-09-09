@@ -12,18 +12,6 @@ Download the latest release and unzip it into
 `World of Warcraft/_retail_/Interface/AddOns/`, so that the folder is named
 `LunRollHistory` and `LunRollHistory.toc` sits directly inside it.
 
-To work on it instead, clone straight into the AddOns folder:
-
-```bash
-cd "/path/to/World of Warcraft/_retail_/Interface/AddOns"
-git clone https://github.com/YOURNAME/LunRollHistory.git
-```
-
-The repository root *is* the addon folder, so edits are live: `/reload` in game
-picks them up.
-
-Then `/reload` or restart, and `/lrh` opens the window.
-
 If you previously ran this as RollLedger, the old database is imported
 automatically on first load and you can delete the old folder.
 
@@ -32,11 +20,9 @@ automatically on first load and you can delete the old folder.
 Three ways:
 
 - **`/lrh`** (or `/lunrollhistory`) - toggles the window.
-- **Minimap button** - the dice icon on the minimap ring. Left click opens the
-  ledger, right click jumps to capture settings, drag moves it around the ring.
+- **Minimap button** - the icon on the minimap ring. Left click opens the
+  window, right click jumps to capture settings, drag moves it around the ring.
   Hide it with `/lrh minimap` or the toggle on the Appearance page.
-- **Addon compartment** - the menu behind the icon next to the minimap clock,
-  wired up through the TOC so it costs no taint.
 
 ## Commands
 
@@ -53,21 +39,12 @@ Three ways:
 
 ## The window
 
-`preview.html` is a static mock of the interface, rendered from the same colour
-and spacing values the addon uses. Open it in a browser to check the look, click
-the swatches to try the accent presets.
-
-The sidebar logo is `media/Logo.tga` (128x128, uncompressed 32-bit, power-of-two
-as WoW requires; PNG is not a format the client can load). Swap in your own by
-replacing that file at the same dimensions. The same art is used for the minimap
-button and the addon compartment entry.
-
 Six pages behind a sidebar: **Roll History** (filterable, searchable list of every
 roll), **Statistics** (per-player win rate, average roll, contested rolls only),
 **Capture Settings**, **Appearance**, **Export**, and **About**.
 
-**Am I Unlucky?** rates a player 0-100 against what chance would have given
-them. Two bars: **average roll**, which has a known distribution since a `/roll` is
+**Am I Unlucky?** rates a player 0-100 against other players in the history.
+Two bars: **average roll**, which has a known distribution since a `/roll` is
 uniform over 1-100, and **items obtained**, scoring items won against your share
 of each contest - four people rolling means 0.25 of a win each.
 
@@ -80,8 +57,7 @@ ranks on the raw average instead, because that is the number printed beside it.
 
 Every percentage on the page is measured against the other players in your
 history, because every one of them is phrased "than X% of players" and a number
-that says players has to mean players. On your own, with nobody to compare
-against, the wording switches to "than X% of what chance would give you".
+that says players has to mean players.
 
 Items from the loot-award log are reported next to the rating but deliberately
 kept out of it. "Items received" has no denominator the way "rolls won" does, it
@@ -96,11 +72,7 @@ renders as a blank box. Uncontested drops are excluded from the win model since
 winning alone says nothing.
 
 **Roll History** columns are resizable: drag the divider in the header, right
-click one to reset. A drag is a transfer between the two columns the divider
-separates, so the divider tracks the cursor and nothing else on the row moves.
-Resizing the column to the left of a divider instead looks equivalent and is
-not: with a flexible column further left it absorbs the change, everything
-after it slides, and the divider cannot move at all. Widths persist. The Item column is flexible and absorbs
+click one to reset. Widths persist. The Item column is flexible and absorbs
 leftover space; when the window gets too narrow for that, the fixed columns give
 up their slack proportionally rather than letting the row overflow. A squeeze
 only affects the rendered width, so widening the window restores what you chose.
@@ -193,20 +165,8 @@ GROUP BY player ORDER BY wins DESC;
 
 ## Taint safety
 
-The addon writes to no Blizzard-owned table or frame. Three things were removed
-after a `blocked from an action only available to the Blizzard UI` report:
-
-- **No `UISpecialFrames` entry.** Inserting a frame name there taints Blizzard's
-  table, and the taint rides into `CloseSpecialWindows` and from there into the
-  ESC / game-menu path. ESC is handled on our own frame instead, and keyboard
-  capture is left alone entirely while `InCombatLockdown()` is true.
-- **No `StaticPopupDialogs` entry.** Registering a dialog there hands our
-  insecure table to Blizzard's popup code for every popup afterwards, not just
-  ours. The wipe confirmation is drawn from the addon's own widgets.
-- **No regions created on `UIParent`.** The font probe lives on a private
-  hidden frame.
-
-If a block ever appears again, `/console taintLog 2`, `/reload`, reproduce it,
+The addon writes to no Blizzard-owned table or frame.
+If a block ever appears, `/console taintLog 2`, `/reload`, reproduce it,
 then read `Logs/taint.log` in the WoW folder. It names the exact file and
 function, which beats guessing.
 
@@ -220,10 +180,6 @@ than taking the addon down. `Core.lua` picks up a secret-check global
 automatically if your build exposes one; add its name to the `isSecret` line if
 it differs.
 
-**No addon messages during boss encounters.** This addon sends none. Every
-client already sees the full group loot history, so cross-client sync buys
-nothing.
-
 **Restricted chat during encounters and M+.** `/roll` messages fired mid-pull
 may arrive unreadable. Group loot history is unaffected and resolves after the
 kill, which is when rolls happen anyway. `/lrh sweep` backfills.
@@ -232,31 +188,6 @@ kill, which is when rolls happen anyway. `/lrh sweep` backfills.
 `ns:Field(tbl, "playerName", "name")` tries several candidates, and enum values
 are decoded from `Enum.EncounterLootDropRollState` at runtime instead of being
 hardcoded, so a renumbered enum will not silently mislabel Greed as Need.
-
-## Tests
-
-```bash
-lua5.1 tests/run.lua       # 210 assertions
-```
-
-Paths resolve relative to the script, so it runs from any checkout. CI runs the
-same suite on every push, plus a syntax check and a non-ASCII guard.
-
-The harness stubs `CreateFrame` with an explicit whitelist of real WoW widget
-methods, so any invented API call fails loudly instead of silently no-opping.
-It builds every page headlessly and exercises tab filtering, search, list
-virtualisation, scroll clamping, accent switching, the wipe confirmation, ESC
-being inert during combat, the two Blizzard tables staying untouched, and the
-migration from the old addon name - plus the capture-layer tests: duplicate
-`LOOT_HISTORY_UPDATE_DROP` events collapsing into one record, GUID-only entries
-resolving to names, secret values failing safely, and CSV quoting surviving item
-names with commas and periods.
-
-## Notes on the look
-
-The visual language (dark violet panels, accent-underlined tabs, sidebar with
-section headers) is modelled on the EllesmereUI options window. No EllesmereUI
-code, art, or dependency is involved - it is an independent implementation.
 
 ## Legal
 

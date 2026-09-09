@@ -1297,7 +1297,7 @@ function UI:UpdateStatus()
         end
     end
     frame.sideStatus:SetText(string.format("v%s\n%d entries  |  %d rolls",
-        ns.VERSION or "1.0.0", entries, rolls))
+        ns.VERSION or "1.0.1", entries, rolls))
 end
 
 function UI:Refresh()

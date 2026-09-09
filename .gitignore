@@ -1,0 +1,22 @@
+# Test output: a generated SavedVariables sample, not source.
+tests/LunRollHistory.lua
+
+# Local importer output
+*.sqlite
+*.sqlite3
+*.csv
+__pycache__/
+*.pyc
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# Never commit real saved variables: they contain your raid's roll history
+# and player names.
+**/WTF/
+LunRollHistory.lua.bak

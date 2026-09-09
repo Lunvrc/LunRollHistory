@@ -1,0 +1,44 @@
+name: tests
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  lua:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Lua 5.1
+        # 5.1 is the interpreter the WoW client runs, so the suite runs on the
+        # same version rather than a newer one that would accept code the game
+        # would reject.
+        run: sudo apt-get update && sudo apt-get install -y lua5.1
+
+      - name: Syntax check every file
+        run: |
+          for f in *.lua; do
+            lua5.1 -e "assert(loadfile('$f'))" || exit 1
+          done
+
+      - name: Reject non-ASCII in Lua sources
+        run: |
+          if grep -rnP '[^\x00-\x7F]' *.lua; then
+            echo "Non-ASCII characters found in Lua sources"
+            exit 1
+          fi
+
+      - name: Run test suite
+        run: lua5.1 tests/run.lua
+
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Import script compiles
+        run: python -m py_compile tools/lunrollhistory_import.py

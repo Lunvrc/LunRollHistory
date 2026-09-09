@@ -1,0 +1,13 @@
+# Lua and text files are normalised to LF in the repo. Without this, editing on
+# Windows commits CRLF and every line shows as changed the first time someone
+# on another platform touches the file.
+*.lua    text eol=lf
+*.toc    text eol=lf
+*.md     text eol=lf
+*.py     text eol=lf
+*.html   text eol=lf
+
+# The logo is binary. Marking it stops git from trying to diff or convert it.
+*.tga    binary
+*.blp    binary
+*.png    binary

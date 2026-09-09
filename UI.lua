@@ -34,10 +34,12 @@ local function ItemColor(link)
 end
 
 -- Flattens the log into one view model per displayable line.
+local MAX_VIEW_ROWS = 5000
+
 local function BuildRows(filter, search)
     local db = LunRollHistoryDB
     local out = {}
-    if not db then return out end
+    if not db then return out, false end
     search = (search or ""):lower()
 
     local function matches(vm)
@@ -47,7 +49,10 @@ local function BuildRows(filter, search)
             or (vm.encounter and vm.encounter:lower():find(search, 1, true))
     end
 
+    -- Newest first, and stop once the screen is fed. The list is virtualised,
+    -- so building more than this is work nobody ever sees.
     for i = #db.log, 1, -1 do
+        if #out >= MAX_VIEW_ROWS then return out, true end
         local e = db.log[i]
         if e.t == "drop" and type(e.rolls) == "table" then
             if filter == "all" or filter == "rolls" then
@@ -85,7 +90,7 @@ local function BuildRows(filter, search)
             end
         end
     end
-    return out
+    return out, false
 end
 
 local function BuildStats()
@@ -93,7 +98,8 @@ local function BuildStats()
     local players, order = {}, {}
     if not db then return order end
 
-    for i = 1, #db.log do
+    local from = math.max(1, #db.log - ns.MAX_SCAN + 1)
+    for i = from, #db.log do
         local e = db.log[i]
         if e.t == "drop" and type(e.rolls) == "table" then
             for j = 1, #e.rolls do
@@ -266,9 +272,10 @@ local function CreateHistoryPage(parent)
 
     function page:Reload()
         head:Layout()
-        local rows = BuildRows(self.filter, self.search)
+        local rows, truncated = BuildRows(self.filter, self.search)
         list:SetData(rows)
         if #rows == 0 then empty:Show() else empty:Hide() end
+        page.truncated = truncated
         if self.OnCount then self:OnCount(#rows) end
     end
 
@@ -677,17 +684,54 @@ local function CreateCapturePage(parent)
     cleanButton:SetPoint("RIGHT", -14, 0)
     rows[#rows + 1] = cleanRow
 
+    -- Stepped rather than linear: a 2,000 to 1,000,000 range on a linear slider
+    -- makes every useful value sit in the first pixel.
+    local SIZE_STOPS = { 2000, 5000, 10000, 25000, 50000, 100000, 250000, 500000, 1000000 }
+
+    local function StopIndex(value)
+        local best, bestDiff = 1, math.huge
+        for i, stop in ipairs(SIZE_STOPS) do
+            local diff = math.abs(stop - (value or 20000))
+            if diff < bestDiff then best, bestDiff = i, diff end
+        end
+        return best
+    end
+
+    local function FormatStop(value)
+        if value >= 1000000 then return string.format("%.0fM", value / 1000000) end
+        return string.format("%.0fk", value / 1000)
+    end
+
     local sliderRow = W.SettingRow(body, "History size",
-        "Oldest entries are dropped past this. Import to SQLite regularly and the database outlives the window.", 200)
-    local slider = W.Slider(sliderRow, 2000, 50000, 1000,
-        function() return ns.MAX_ENTRIES end,
-        function(v)
-            ns.MAX_ENTRIES = v
-            if LunRollHistoryDB then LunRollHistoryDB.settings.maxEntries = v end
+        "Oldest entries are dropped past this.", 200)
+    local slider = W.Slider(sliderRow, 1, #SIZE_STOPS, 1,
+        function() return StopIndex(ns.MAX_ENTRIES) end,
+        function(index)
+            local value = SIZE_STOPS[math.max(1, math.min(#SIZE_STOPS, math.floor(index + 0.5)))]
+            ns.MAX_ENTRIES = value
+            if LunRollHistoryDB then LunRollHistoryDB.settings.maxEntries = value end
+            if sliderRow.UpdateEstimate then sliderRow:UpdateEstimate() end
         end,
-        function(v) return string.format("%d", v) end)
+        function(index)
+            return FormatStop(SIZE_STOPS[math.max(1, math.min(#SIZE_STOPS, math.floor(index + 0.5)))])
+        end)
     slider:SetPoint("RIGHT", -14, 0)
     slider:SetWidth(200)
+
+    -- The cost of a large cap should be visible here, not discovered at the
+    -- next logout when the client writes the file.
+    function sliderRow:UpdateEstimate()
+        local bytes = ns:EstimateBytes(ns.MAX_ENTRIES)
+        local text = string.format(
+            "About %s of SavedVariables when full. (THIS IS STORED IN YOUR RAM) written on logout. Import to SQLite regularly and the database outlives the window.",
+            ns:FormatBytes(bytes))
+        self.desc:SetText("Oldest entries are dropped past this. " .. text)
+        if bytes > 512 * 1024 * 1024 then
+            self.desc:SetTextColor(C.bad[1], C.bad[2], C.bad[3])
+        else
+            self.desc:SetTextColor(C.textFaint[1], C.textFaint[2], C.textFaint[3])
+        end
+    end
     rows[#rows + 1] = sliderRow
 
     function page:Layout()
@@ -698,6 +742,7 @@ local function CreateCapturePage(parent)
         for _, toggle in ipairs(toggles) do toggle:Refresh() end
         qualityDrop:Refresh()
         slider:Refresh()
+        sliderRow:UpdateEstimate()
         self:Layout()
     end
 

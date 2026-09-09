@@ -6,7 +6,10 @@ local ADDON, ns = ...
 ns.ADDON        = ADDON
 ns.VERSION      = "1.0.0"
 ns.DB_VERSION   = 1
-ns.MAX_ENTRIES  = 20000   -- oldest entries are pruned past this
+ns.MAX_ENTRIES  = 20000     -- oldest entries are pruned past this
+ns.MAX_CAP      = 1000000   -- highest the History size setting allows
+ns.MAX_SCAN     = 100000    -- newest entries the stats pages will walk
+ns.PRUNE_SLACK  = 0.02      -- prune this much extra so it happens rarely
 ns.debug        = false
 
 --------------------------------------------------------------------------------
@@ -135,6 +138,7 @@ local function ApplyDefaults()
     if s.captureRollStarts  == nil then s.captureRollStarts  = true  end
     if s.groupOnly          == nil then s.groupOnly          = false end
     if s.maxEntries         == nil then s.maxEntries         = ns.MAX_ENTRIES end
+    s.maxEntries = math.max(1000, math.min(ns.MAX_CAP, s.maxEntries))
     if s.accent             == nil then s.accent             = "orchid" end
     if s.accentColor        == nil then s.accentColor        = { ns.Theme.DEFAULT_ACCENT[1],
                                                                 ns.Theme.DEFAULT_ACCENT[2],
@@ -187,10 +191,48 @@ function ns:Append(rec)
     local log = db.log
     log[#log + 1] = rec
 
-    while #log > ns.MAX_ENTRIES do
-        table.remove(log, 1)
+    -- table.remove(log, 1) shifts every remaining element, which is 2.8ms at
+    -- 200k entries and worse beyond. Doing it once per append past the cap put
+    -- a frame hitch on every loot event. Pruning a batch instead makes it rare
+    -- and amortises to nothing.
+    local count = #log
+    if count > ns.MAX_ENTRIES then
+        local target = math.max(1, math.floor(ns.MAX_ENTRIES * (1 - ns.PRUNE_SLACK)))
+        local drop = count - target
+        for i = 1, count - drop do log[i] = log[i + drop] end
+        for i = count - drop + 1, count do log[i] = nil end
     end
     return rec
+end
+
+-- Rough serialised size of the log. Measured against the real serialiser: a
+-- 20-roll drop entry comes to about 4.85 KB, which this reproduces to within a
+-- couple of percent.
+function ns:EstimateBytes(entries)
+    local db = LunRollHistoryDB
+    local sampleEntries, sampleRolls = 0, 0
+    if db then
+        local log = db.log
+        local from = math.max(1, #log - 500)
+        for i = from, #log do
+            local e = log[i]
+            sampleEntries = sampleEntries + 1
+            if e.t == "drop" and type(e.rolls) == "table" then
+                sampleRolls = sampleRolls + #e.rolls
+            end
+        end
+    end
+    local avgRolls = (sampleEntries > 0) and (sampleRolls / sampleEntries) or 10
+    return math.floor((420 + 225 * avgRolls) * (entries or ns.MAX_ENTRIES))
+end
+
+function ns:FormatBytes(bytes)
+    if bytes >= 1024 * 1024 * 1024 then
+        return string.format("%.1f GB", bytes / 1024 / 1024 / 1024)
+    elseif bytes >= 1024 * 1024 then
+        return string.format("%.0f MB", bytes / 1024 / 1024)
+    end
+    return string.format("%.0f KB", bytes / 1024)
 end
 
 function ns:ShouldCapture()

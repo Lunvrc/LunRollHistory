@@ -974,12 +974,17 @@ end
 -- Owns the column widths and the drag handles between them. Rows ask it where
 -- each column starts and how wide it is, so the header and the rows can never
 -- disagree about the layout.
-function W.ColumnHeader(parent, columns, onResize)
+-- opts.onSort makes the header labels clickable. The drag handles stay on top
+-- of the buttons, so grabbing a divider never registers as a sort.
+function W.ColumnHeader(parent, columns, onResize, opts)
+    opts = opts or {}
     local head = CreateFrame("Frame", nil, parent)
     head:SetHeight(22)
     head.columns = columns
     head.labels = {}
     head.handles = {}
+    head.buttons = {}
+    head.sortKey, head.sortDesc = opts.sortKey, opts.sortDesc
 
     local underline = W.Divider(head)
     underline:SetPoint("BOTTOMLEFT", 0, 0)
@@ -993,6 +998,31 @@ function W.ColumnHeader(parent, columns, onResize)
         label:SetWordWrap(false)
         head.labels[i] = label
 
+        if opts.onSort then
+            local button = CreateFrame("Button", nil, head)
+            button:SetFrameLevel((head:GetFrameLevel() or 1) + 1)
+            button.colKey = col.key
+            button.colIndex = i
+            button:SetScript("OnEnter", function(self)
+                if head.sortKey ~= self.colKey then
+                    head.labels[self.colIndex]:SetTextColor(0.8, 0.78, 0.84)
+                end
+            end)
+            button:SetScript("OnLeave", function() head:PaintSort() end)
+            button:SetScript("OnClick", function(self)
+                if head.sortKey == self.colKey then
+                    head.sortDesc = not head.sortDesc
+                else
+                    head.sortKey = self.colKey
+                    -- Text reads best A to Z; times and numbers highest first.
+                    head.sortDesc = not (col.ascending and true or false)
+                end
+                head:PaintSort()
+                opts.onSort(head.sortKey, head.sortDesc)
+            end)
+            head.buttons[i] = button
+        end
+
         -- No handle after the last column: there is nothing to its right to
         -- take the space from.
         if i < #columns then
@@ -1002,6 +1032,9 @@ function W.ColumnHeader(parent, columns, onResize)
             handle:SetPoint("BOTTOM", 0, 0)
             handle:RegisterForClicks("LeftButtonDown", "RightButtonUp")
             handle:EnableMouse(true)
+
+            -- Above the sort buttons: the divider must win at the edges.
+            handle:SetFrameLevel((head:GetFrameLevel() or 1) + 5)
 
             local grip = handle:CreateTexture(nil, "ARTWORK")
             grip:SetTexture(WHITE)
@@ -1077,6 +1110,15 @@ function W.ColumnHeader(parent, columns, onResize)
             label:ClearAllPoints()
             label:SetPoint("LEFT", self, "LEFT", x + (col.pad or 4), 0)
             label:SetWidth(math.max(10, col.render - (col.pad or 4) * 2))
+
+            local button = self.buttons[i]
+            if button then
+                button:ClearAllPoints()
+                button:SetPoint("TOPLEFT", self, "TOPLEFT", x, 0)
+                button:SetPoint("BOTTOMLEFT", self, "BOTTOMLEFT", x, 0)
+                -- Stops short of the divider so the drag handle stays reachable.
+                button:SetWidth(math.max(10, col.render - 6))
+            end
 
             local handle = self.handles[i]
             if handle then
@@ -1168,7 +1210,28 @@ function W.ColumnHeader(parent, columns, onResize)
         end)
     end
 
+    -- Single entry point, so the marker cannot drift out of step with the
+    -- sort the list is actually using.
+    function head:SetSort(key, descending)
+        self.sortKey, self.sortDesc = key, descending
+        self:PaintSort()
+    end
+
+    function head:PaintSort()
+        for i, col in ipairs(self.columns) do
+            local label = self.labels[i]
+            if self.sortKey == col.key then
+                label:SetText(col.title:upper() .. (self.sortDesc and "  v" or "  ^"))
+                label:SetTextColor(T.accent[1], T.accent[2], T.accent[3])
+            else
+                label:SetText(col.title:upper())
+                label:SetTextColor(C.textFaint[1], C.textFaint[2], C.textFaint[3])
+            end
+        end
+    end
+
     head:SetScript("OnSizeChanged", function(self) self:Layout() end)
+    if opts.onSort then head:PaintSort() end
     return head
 end
 

@@ -1,0 +1,9 @@
+ignore:
+  - .github
+  - .gitignore
+  - .gitattributes
+  - .tests
+  - .git
+  - .tools
+  - README.md
+  - preview.html

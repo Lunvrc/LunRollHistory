@@ -93,10 +93,28 @@ local function BuildRows(filter, search)
     return out, false
 end
 
-local function BuildStats()
+-- Roll type buckets. The enum names are what Capture stores, but the labels
+-- people actually use are shorter, so the mapping lives here rather than
+-- leaking enum spelling into the interface.
+local ROLL_FILTERS = {
+    { key = "all",      label = "All" },
+    { key = "need",     label = "Need",     states = { NeedMainSpec = true, Need = true } },
+    { key = "greed",    label = "Greed",    states = { Greed = true } },
+    { key = "transmog", label = "Transmog", states = { Transmog = true } },
+}
+
+local function RollFilterFor(key)
+    for _, f in ipairs(ROLL_FILTERS) do
+        if f.key == key then return f end
+    end
+    return ROLL_FILTERS[1]
+end
+
+local function BuildStats(filterKey)
     local db = LunRollHistoryDB
     local players, order = {}, {}
     if not db then return order end
+    local filter = RollFilterFor(filterKey)
 
     local from = math.max(1, #db.log - ns.MAX_SCAN + 1)
     for i = from, #db.log do
@@ -104,9 +122,11 @@ local function BuildStats()
         if e.t == "drop" and type(e.rolls) == "table" then
             for j = 1, #e.rolls do
                 local r = e.rolls[j]
-                local isRoll = r.roll and r.roll > 0
+                local contested = r.roll and r.roll > 0
                     and r.state ~= "Pass" and r.state ~= "NoRoll"
-                if r.name and isRoll then
+                local matches = contested
+                    and (not filter.states or (r.state and filter.states[r.state]))
+                if r.name and matches then
                     local p = players[r.name]
                     if not p then
                         p = { name = r.name, class = r.class, rolls = 0, wins = 0, total = 0 }
@@ -125,11 +145,29 @@ local function BuildStats()
         p.avg = (p.rolls > 0) and (p.total / p.rolls) or 0
         p.winRate = (p.rolls > 0) and (p.wins / p.rolls) or 0
     end
-    table.sort(order, function(a, b)
-        if a.wins ~= b.wins then return a.wins > b.wins end
-        return a.rolls > b.rolls
-    end)
     return order
+end
+
+-- Sorting is a separate step so the same data can be re-ordered without
+-- rebuilding it from the log.
+local STATS_COLUMNS = {
+    { key = "name",    title = "Player",   ascending = true },
+    { key = "winRate", title = "Win rate" },
+    { key = "rolls",   title = "Rolls" },
+    { key = "wins",    title = "Wins" },
+    { key = "avg",     title = "Avg" },
+}
+
+local function SortStats(rows, key, descending)
+    table.sort(rows, function(a, b)
+        local x, y = a[key], b[key]
+        if x == y or x == nil or y == nil then
+            return (a.name or "") < (b.name or "")   -- stable, readable tiebreak
+        end
+        if descending then return x > y end
+        return x < y
+    end)
+    return rows
 end
 
 --------------------------------------------------------------------------------
@@ -137,11 +175,36 @@ end
 --------------------------------------------------------------------------------
 local HISTORY_COLUMNS = {
     { key = "time",   title = "Time",   default = 96,  min = 56 },
-    { key = "item",   title = "Item",   default = 250, min = 110, flex = true },
-    { key = "player", title = "Player", default = 140, min = 80 },
-    { key = "type",   title = "Type",   default = 122, min = 70 },
+    { key = "item",   title = "Item",   default = 250, min = 110, flex = true, ascending = true },
+    { key = "player", title = "Player", default = 140, min = 80, ascending = true },
+    { key = "type",   title = "Type",   default = 122, min = 70, ascending = true },
     { key = "roll",   title = "Roll",   default = 62,  min = 44, justify = "RIGHT" },
 }
+
+-- What each column sorts on. Text lowercased so the order is not split by
+-- capitalisation, and missing values sort last rather than throwing.
+local HISTORY_SORT = {
+    time   = function(vm) return vm.ts or 0 end,
+    item   = function(vm) return (vm.item or vm.encounter or ""):lower() end,
+    player = function(vm) return (vm.player or ""):lower() end,
+    type   = function(vm) return (vm.rollType or ""):lower() end,
+    roll   = function(vm) return vm.roll or -1 end,
+}
+
+local function SortHistory(rows, key, descending)
+    local accessor = HISTORY_SORT[key]
+    if not accessor then return rows end
+    table.sort(rows, function(a, b)
+        local x, y = accessor(a), accessor(b)
+        if x == y then
+            -- Newest first within a tie, so equal rolls stay in a sane order.
+            return (a.ts or 0) > (b.ts or 0)
+        end
+        if descending then return x > y end
+        return x < y
+    end)
+    return rows
+end
 
 local function LoadColumnWidths(columns)
     local saved = LunRollHistoryDB and LunRollHistoryDB.settings.columnWidths
@@ -182,9 +245,17 @@ local function CreateHistoryPage(parent)
 
     local list
 
+    page.sortKey, page.sortDesc = "time", true
+
     local head = W.ColumnHeader(page, columns, function()
         if list then list:Refresh() end
-    end)
+    end, {
+        sortKey = "time", sortDesc = true,
+        onSort = function(key, descending)
+            page.sortKey, page.sortDesc = key, descending
+            page:Reload()
+        end,
+    })
     head:SetPoint("TOPLEFT", search, "BOTTOMLEFT", 0, -10)
     head:SetPoint("TOPRIGHT", search, "BOTTOMRIGHT", 0, -10)
     head.onCommit = SaveColumnWidths
@@ -272,7 +343,9 @@ local function CreateHistoryPage(parent)
 
     function page:Reload()
         head:Layout()
+        head:SetSort(self.sortKey, self.sortDesc)
         local rows, truncated = BuildRows(self.filter, self.search)
+        SortHistory(rows, self.sortKey, self.sortDesc)
         list:SetData(rows)
         if #rows == 0 then empty:Show() else empty:Hide() end
         page.truncated = truncated
@@ -288,31 +361,120 @@ end
 --------------------------------------------------------------------------------
 local function CreateStatsPage(parent)
     local page = CreateFrame("Frame", nil, parent)
+    page.filter = "all"
+    page.sortKey = "wins"
+    page.sortDesc = true
 
     local caption = W.Text(page, "Counts only contested rolls. Passes and auto-greeds are excluded.",
         11, C.textFaint)
     caption:SetPoint("TOPLEFT", 2, -2)
+
+    -- Roll type filter, pinned to the right of the caption.
+    page.filterButtons = {}
+    local previous
+    for i = #ROLL_FILTERS, 1, -1 do
+        local spec = ROLL_FILTERS[i]
+        local b = CreateFrame("Button", nil, page)
+        b:SetSize(66, 20)
+        if previous then
+            b:SetPoint("RIGHT", previous, "LEFT", -4, 0)
+        else
+            b:SetPoint("TOPRIGHT", page, "TOPRIGHT", 0, 2)
+        end
+        previous = b
+
+        b.bg = W.Fill(b, "BACKGROUND", C.panel)
+        W.Border(b, C.borderSoft)
+        b.label = W.Text(b, spec.label, 11, C.textDim)
+        b.label:SetPoint("CENTER")
+        b.label:SetJustifyH("CENTER")
+        b.filterKey = spec.key
+
+        function b:Paint()
+            if page.filter == self.filterKey then
+                for _, edge in ipairs(self.borderEdges) do
+                    edge:SetColorTexture(T.accent[1], T.accent[2], T.accent[3], 1)
+                end
+                self.label:SetTextColor(1, 1, 1)
+            else
+                for _, edge in ipairs(self.borderEdges) do
+                    edge:SetColorTexture(C.borderSoft[1], C.borderSoft[2], C.borderSoft[3], 1)
+                end
+                self.label:SetTextColor(C.textDim[1], C.textDim[2], C.textDim[3])
+            end
+        end
+
+        b:SetScript("OnEnter", function(self)
+            self.bg:SetColorTexture(C.panelHover[1], C.panelHover[2], C.panelHover[3], 1)
+        end)
+        b:SetScript("OnLeave", function(self)
+            self.bg:SetColorTexture(C.panel[1], C.panel[2], C.panel[3], 1)
+        end)
+        b:SetScript("OnClick", function(self)
+            page.filter = self.filterKey
+            page:Reload()
+        end)
+        page.filterButtons[#page.filterButtons + 1] = b
+    end
 
     local head = CreateFrame("Frame", nil, page)
     head:SetHeight(20)
     head:SetPoint("TOPLEFT", caption, "BOTTOMLEFT", -2, -12)
     head:SetPoint("RIGHT", page, "RIGHT", 0, 0)
 
-    local function Head(text, point, x, width, justify)
-        local fs = W.Text(head, text:upper(), 10, C.textFaint)
-        fs:SetPoint(point, x, 0)
-        if width then fs:SetWidth(width) end
-        fs:SetJustifyH(justify or "LEFT")
-    end
-    Head("Player", "LEFT", 4)
-    Head("Win rate", "LEFT", 190)
-    Head("Rolls", "RIGHT", -170, 50, "RIGHT")
-    Head("Wins", "RIGHT", -96, 50, "RIGHT")
-    Head("Avg", "RIGHT", -14, 50, "RIGHT")
-
     local underline = W.Divider(head)
     underline:SetPoint("BOTTOMLEFT", 0, 0)
     underline:SetPoint("BOTTOMRIGHT", 0, 0)
+
+    -- Column headers double as sort controls.
+    page.headers = {}
+    local LAYOUT = {
+        name    = { point = "LEFT",  x = 4,    width = 180, justify = "LEFT" },
+        winRate = { point = "LEFT",  x = 190,  width = 150, justify = "LEFT" },
+        rolls   = { point = "RIGHT", x = -170, width = 50,  justify = "RIGHT" },
+        wins    = { point = "RIGHT", x = -96,  width = 50,  justify = "RIGHT" },
+        avg     = { point = "RIGHT", x = -14,  width = 50,  justify = "RIGHT" },
+    }
+
+    for _, col in ipairs(STATS_COLUMNS) do
+        local layout = LAYOUT[col.key]
+        local b = CreateFrame("Button", nil, head)
+        b:SetPoint(layout.point, layout.x, 0)
+        b:SetSize(layout.width, 20)
+
+        b.label = W.Text(b, col.title:upper(), 10, C.textFaint)
+        b.label:SetPoint(layout.point == "RIGHT" and "RIGHT" or "LEFT", 0, 0)
+        b.label:SetJustifyH(layout.justify)
+        b.colKey = col.key
+        b.defaultAscending = col.ascending and true or false
+
+        function b:Paint()
+            if page.sortKey == self.colKey then
+                -- The arrow points the way the values run down the column.
+                self.label:SetText(col.title:upper() .. (page.sortDesc and "  v" or "  ^"))
+                self.label:SetTextColor(T.accent[1], T.accent[2], T.accent[3])
+            else
+                self.label:SetText(col.title:upper())
+                self.label:SetTextColor(C.textFaint[1], C.textFaint[2], C.textFaint[3])
+            end
+        end
+
+        b:SetScript("OnEnter", function(self)
+            if page.sortKey ~= self.colKey then self.label:SetTextColor(0.8, 0.78, 0.84) end
+        end)
+        b:SetScript("OnLeave", function(self) self:Paint() end)
+        b:SetScript("OnClick", function(self)
+            if page.sortKey == self.colKey then
+                page.sortDesc = not page.sortDesc
+            else
+                page.sortKey = self.colKey
+                -- Names read best A to Z, numbers best highest first.
+                page.sortDesc = not self.defaultAscending
+            end
+            page:Reload()
+        end)
+        page.headers[col.key] = b
+    end
 
     local list = W.List(page, 30,
         function(listFrame)
@@ -373,11 +535,15 @@ local function CreateStatsPage(parent)
     local empty = W.EmptyState(list, "Nothing to summarise yet.")
 
     function page:Reload()
-        local stats = BuildStats()
+        local stats = SortStats(BuildStats(self.filter), self.sortKey, self.sortDesc)
+        self.rows = stats
         list:SetData(stats)
         if #stats == 0 then empty:Show() else empty:Hide() end
+        for _, b in ipairs(self.filterButtons) do b:Paint() end
+        for _, b in pairs(self.headers) do b:Paint() end
     end
 
+    page.list = list
     return page
 end
 
@@ -593,6 +759,477 @@ local function CreateLuckPage(parent)
 end
 
 --------------------------------------------------------------------------------
+-- Page: Mythic+
+--------------------------------------------------------------------------------
+-- The dungeon grid builds itself from C_ChallengeMode.GetMapTable(), so a new
+-- season needs no code change: names, icons and the tile count all come from
+-- whatever the client is running. Only the abbreviation overrides in
+-- Mythic.lua are worth touching by hand.
+local TILE_W, TILE_H, TILE_GAP = 92, 88, 8
+
+local function CreateMythicPage(parent)
+    local page = CreateFrame("Frame", nil, parent)
+    local scroll = W.ScrollPage(page)
+    local body = scroll.content
+    local rows = {}
+
+    page.selectedMap = nil
+
+    ---------------------------------------------------------------- grid ----
+    local gridRow = W.Panel(body, { color = C.row })
+    gridRow.title = W.Text(gridRow, "Season dungeons", 12.5, C.text)
+    gridRow.title:SetPoint("TOPLEFT", 14, -12)
+    gridRow.hint = W.Text(gridRow, "", 11, C.textFaint)
+    gridRow.hint:SetPoint("TOPRIGHT", -14, -12)
+    gridRow.hint:SetJustifyH("RIGHT")
+
+    gridRow.tiles = {}
+
+    local function AcquireTile(index)
+        local tile = gridRow.tiles[index]
+        if tile then return tile end
+
+        tile = CreateFrame("Button", nil, gridRow)
+        tile:SetSize(TILE_W, TILE_H)
+
+        tile.art = tile:CreateTexture(nil, "ARTWORK")
+        tile.art:SetPoint("TOPLEFT", 2, -2)
+        tile.art:SetPoint("TOPRIGHT", -2, -2)
+        tile.art:SetHeight(TILE_H - 24)
+        -- Always full colour. Selection is shown with the accent border and a
+        -- brightened label instead of draining the colour out of the rest.
+        tile.art:SetDesaturated(false)
+
+        tile.label = W.Text(tile, "", 12, C.textDim)
+        tile.label:SetPoint("BOTTOM", 0, 4)
+        tile.label:SetJustifyH("CENTER")
+        tile.label:SetWidth(TILE_W - 4)
+
+        tile.count = W.Text(tile, "", 10, C.textFaint)
+        tile.count:SetPoint("TOPRIGHT", -5, -5)
+        tile.count:SetJustifyH("RIGHT")
+
+        W.Border(tile, C.borderSoft)
+
+        tile:SetScript("OnEnter", function(self)
+            if not self.selected then
+                for _, edge in ipairs(self.borderEdges) do
+                    edge:SetColorTexture(1, 1, 1, 0.35)
+                end
+            end
+        end)
+        tile:SetScript("OnLeave", function(self) self:Paint() end)
+        tile:SetScript("OnClick", function(self)
+            page.selectedMap = self.mapID
+            page:Reload()
+        end)
+
+        function tile:Paint()
+            if self.selected then
+                for _, edge in ipairs(self.borderEdges) do
+                    edge:SetColorTexture(T.accent[1], T.accent[2], T.accent[3], 1)
+                end
+                self.label:SetTextColor(1, 1, 1)
+            else
+                for _, edge in ipairs(self.borderEdges) do
+                    edge:SetColorTexture(C.borderSoft[1], C.borderSoft[2], C.borderSoft[3], 1)
+                end
+                self.label:SetTextColor(C.textDim[1], C.textDim[2], C.textDim[3])
+            end
+        end
+
+        gridRow.tiles[index] = tile
+        return tile
+    end
+
+    -- Column count is chosen from the dungeon count, not from whatever width
+    -- the frame happens to report. Eight dungeons give 4x2, which is what a
+    -- season looks like; the width only ever caps it.
+    local function ColumnsFor(count, maxFit)
+        if count <= 0 then return 1, 1 end
+        maxFit = math.max(1, maxFit)
+
+        local perRow
+        if count <= 5 and count <= maxFit then
+            perRow = count                      -- a short season fits on one row
+        else
+            perRow = math.min(math.ceil(count / 2), maxFit)
+        end
+
+        -- Even the rows out so the last one is not left ragged.
+        local lines = math.ceil(count / perRow)
+        perRow = math.ceil(count / lines)
+        return perRow, math.ceil(count / perRow)
+    end
+
+    function gridRow:Available()
+        -- On the first pass this frame has not been anchored yet and reports
+        -- zero, which is what stacked every tile into a single column until
+        -- something forced a second layout.
+        local width = self:GetWidth() or 0
+        if width < 100 then width = body:GetWidth() or 0 end
+        if width < 100 then width = scroll:GetWidth() or 0 end
+        if width < 100 then width = (parent and parent:GetWidth()) or 0 end
+        if width < 100 then width = 640 end
+        return width
+    end
+
+    function gridRow:Arrange()
+        local buckets = self.buckets or {}
+        local available = self:Available() - 28
+        local maxFit = math.max(1, math.floor((available + TILE_GAP) / (TILE_W + TILE_GAP)))
+        local perRow, lines = ColumnsFor(#buckets, maxFit)
+
+        -- Centre the block rather than left-aligning it against the panel edge.
+        local blockWidth = perRow * TILE_W + (perRow - 1) * TILE_GAP
+        local startX = 14 + math.max(0, (available - blockWidth) / 2)
+
+        for i, bucket in ipairs(buckets) do
+            local tile = self.tiles[i]
+            if tile then
+                local col = (i - 1) % perRow
+                local line = math.floor((i - 1) / perRow)
+                tile:ClearAllPoints()
+                tile:SetPoint("TOPLEFT", self, "TOPLEFT",
+                    startX + col * (TILE_W + TILE_GAP),
+                    -36 - line * (TILE_H + TILE_GAP))
+            end
+        end
+
+        self.perRow = perRow
+        self.usedRows = lines
+    end
+
+    function gridRow:Populate(buckets)
+        self.buckets = buckets
+
+        for i, bucket in ipairs(buckets) do
+            local tile = AcquireTile(i)
+            tile.mapID = bucket.mapID
+            tile.selected = (bucket.mapID == page.selectedMap)
+            tile.label:SetText(bucket.abbr)
+            tile.count:SetText(bucket.runs > 0 and tostring(bucket.runs) or "")
+
+            if bucket.texture then
+                tile.art:SetTexture(bucket.texture)
+                tile.art:SetAlpha(1)
+            else
+                tile.art:SetTexture("Interface\\Buttons\\WHITE8X8")
+                tile.art:SetColorTexture(C.panel[1], C.panel[2], C.panel[3], 1)
+            end
+            tile:Paint()
+            tile:Show()
+        end
+
+        for i = #buckets + 1, #self.tiles do self.tiles[i]:Hide() end
+        self:Arrange()
+    end
+
+    -- Any width change re-runs the arrangement, so a first pass that had no
+    -- width to work with corrects itself instead of staying wrong until click.
+    gridRow:SetScript("OnSizeChanged", function(self)
+        if not self.buckets then return end
+        local before = self.usedRows
+        self:Arrange()
+        if before ~= self.usedRows and page.Layout then page:Layout() end
+    end)
+
+    function gridRow:AutoHeight()
+        local lines = self.usedRows or 1
+        local h = 36 + lines * (TILE_H + TILE_GAP) + 6
+        self:SetHeight(h)
+        return h
+    end
+    rows[#rows + 1] = gridRow
+
+    ------------------------------------------------------------- summary ----
+    local function StatRow(title)
+        local row = W.Panel(body, { color = C.row })
+        row.title = W.Text(row, title, 12.5, C.text)
+        row.title:SetPoint("TOPLEFT", 14, -12)
+        row.value = W.Text(row, "-", 12.5, C.textDim)
+        row.value:SetPoint("TOPRIGHT", -14, -12)
+        row.value:SetJustifyH("RIGHT")
+        row.meter = W.Meter(row)
+        row.meter:SetPoint("TOPLEFT", 14, -36)
+        row.meter:SetPoint("RIGHT", row, "RIGHT", -14, 0)
+        row.verdict = W.Text(row, "", 11, C.textFaint)
+        row.verdict:SetPoint("TOPLEFT", 14, -48)
+        row.verdict:SetPoint("RIGHT", row, "RIGHT", -14, 0)
+        row.verdict:SetWordWrap(true)
+
+        function row:AutoHeight()
+            local h = 48 + (self.verdict:GetStringHeight() or 12) + 14
+            self:SetHeight(h)
+            return h
+        end
+        function row:Set(valueText, pct, verdictText)
+            self.value:SetText(valueText or "-")
+            local icon, color = Verdict(pct)
+            self.meter:SetPercent(pct, color)
+            self.verdict:SetText((icon ~= "" and (icon .. " ") or "") .. (verdictText or ""))
+            self.verdict:SetTextColor((color or C.textFaint)[1], (color or C.textFaint)[2],
+                                      (color or C.textFaint)[3])
+        end
+        rows[#rows + 1] = row
+        return row
+    end
+
+    local chestRow = StatRow("Chest luck")
+    local runsRow  = StatRow("Runs")
+    runsRow.meter:Hide()
+    function runsRow:AutoHeight()
+        local titleH = self.title:GetStringHeight() or 14
+        local h = 12 + titleH + 6 + (self.verdict:GetStringHeight() or 12) + 14
+        self:SetHeight(h)
+        self.verdict:ClearAllPoints()
+        self.verdict:SetPoint("TOPLEFT", 14, -(12 + titleH + 6))
+        self.verdict:SetPoint("RIGHT", self, "RIGHT", -14, 0)
+        return h
+    end
+
+    ---------------------------------------------------------- item table ----
+    local itemsRow = W.Panel(body, { color = C.row })
+    itemsRow.title = W.Text(itemsRow, "Items seen drop", 12.5, C.text)
+    itemsRow.title:SetPoint("TOPLEFT", 14, -12)
+    itemsRow.hint = W.Text(itemsRow, "", 11, C.textFaint)
+    itemsRow.hint:SetPoint("TOPRIGHT", -14, -12)
+    itemsRow.hint:SetJustifyH("RIGHT")
+    itemsRow.lines = {}
+
+    local function AcquireItemLine(index)
+        local line = itemsRow.lines[index]
+        if line then return line end
+        line = CreateFrame("Frame", nil, itemsRow)
+        line:SetHeight(20)
+        line.name = W.Text(line, "", 12, C.text)
+        line.name:SetPoint("LEFT", 0, 0)
+        line.name:SetWordWrap(false)
+        line.mine = W.Text(line, "", 11, C.textDim)
+        line.mine:SetPoint("RIGHT", -70, 0)
+        line.mine:SetWidth(90)
+        line.mine:SetJustifyH("RIGHT")
+        line.count = W.Text(line, "", 12, C.text)
+        line.count:SetPoint("RIGHT", 0, 0)
+        line.count:SetWidth(60)
+        line.count:SetJustifyH("RIGHT")
+        itemsRow.lines[index] = line
+        return line
+    end
+
+    -- The journal table is the spine: it lists what can drop, including the
+    -- pieces that never have. Observed counts are laid over it. Anything seen
+    -- drop that the journal does not list is appended rather than dropped, so
+    -- a stale or unmatched journal entry never hides real data.
+    function itemsRow:Populate(bucket, specID)
+        local shown, usedFilter = 0, false
+        if bucket then
+            local journal, filtered = ns.Mythic:LootTable(bucket.mapID, specID)
+            usedFilter = filtered
+
+            local list, seen = {}, {}
+            for _, entry in ipairs(journal) do
+                local observed = bucket.items[entry.itemID]
+                list[#list + 1] = {
+                    itemID = entry.itemID,
+                    name = entry.name,
+                    link = entry.link or (observed and observed.link),
+                    slot = entry.slot,
+                    count = observed and observed.count or 0,
+                    mine = observed and observed.mine or 0,
+                    warbound = observed and observed.warbound or 0,
+                    inJournal = true,
+                }
+                seen[entry.itemID] = true
+            end
+            for _, observed in ipairs(bucket.itemOrder) do
+                if not observed.itemID or not seen[observed.itemID] then
+                    list[#list + 1] = {
+                        itemID = observed.itemID, name = observed.name, link = observed.link,
+                        count = observed.count, mine = observed.mine,
+                        warbound = observed.warbound, inJournal = false,
+                    }
+                end
+            end
+
+            table.sort(list, function(a, b)
+                if a.count ~= b.count then return a.count > b.count end
+                return (a.name or "") < (b.name or "")
+            end)
+
+            for i, entry in ipairs(list) do
+                if i > 60 then break end
+                local line = AcquireItemLine(i)
+                line:ClearAllPoints()
+                line:SetPoint("TOPLEFT", self, "TOPLEFT", 14, -36 - (i - 1) * 20)
+                line:SetPoint("RIGHT", self, "RIGHT", -14, 0)
+                -- A name still loading shows as an ellipsis rather than a raw
+                -- item number, and refreshes when the client answers.
+                line.name:SetText(entry.name or "Loading...")
+                line.name:SetWidth(math.max(60, (self:GetWidth() or 400) - 200))
+                if entry.count > 0 then
+                    line.name:SetTextColor(ItemColor(entry.link))
+                else
+                    -- Never seen: dimmed, so the gaps read at a glance.
+                    line.name:SetTextColor(C.textFaint[1], C.textFaint[2], C.textFaint[3])
+                end
+
+                local detail = ""
+                if entry.mine > 0 then detail = entry.mine .. " to you" end
+                if entry.warbound > 0 then
+                    detail = (detail ~= "" and (detail .. ", ") or "") .. entry.warbound .. " warbound"
+                end
+                if detail == "" and not entry.inJournal then detail = "not in journal" end
+                line.mine:SetText(detail)
+
+                if entry.count > 0 then
+                    line.count:SetText(tostring(entry.count))
+                    line.count:SetTextColor(1, 1, 1)
+                else
+                    line.count:SetText("-")
+                    line.count:SetTextColor(C.textFaint[1], C.textFaint[2], C.textFaint[3])
+                end
+                line:Show()
+                shown = i
+            end
+        end
+        for i = shown + 1, #self.lines do self.lines[i]:Hide() end
+        self.shown = shown
+        self.usedFilter = usedFilter
+    end
+
+    function itemsRow:AutoHeight()
+        local h = 36 + math.max(1, self.shown or 0) * 20 + 12
+        self:SetHeight(h)
+        return h
+    end
+
+    itemsRow.empty = W.Text(itemsRow, "", 11, C.textFaint)
+    itemsRow.empty:SetPoint("TOPLEFT", 14, -38)
+    rows[#rows + 1] = itemsRow
+
+    local note = W.Text(body,
+        "The loot table comes from the Encounter Journal filtered to your loot specialisation, with your recorded drops laid over it. Dimmed rows have never dropped for your group. Your share of a run is whatever the chest actually gave the group divided by the party, so no assumption about how many items a run drops is baked in. Great Vault picks are excluded: that is a choice, not luck.",
+        11, C.textFaint)
+    note:SetJustifyH("LEFT")
+    note:SetWordWrap(true)
+    local noteHolder = CreateFrame("Frame", nil, body)
+    note:SetPoint("TOPLEFT", noteHolder, "TOPLEFT", 2, -6)
+    note:SetPoint("RIGHT", noteHolder, "RIGHT", -2, 0)
+    function noteHolder:AutoHeight()
+        local h = (note:GetStringHeight() or 30) + 16
+        self:SetHeight(h)
+        return h
+    end
+    rows[#rows + 1] = noteHolder
+
+    function page:Layout()
+        scroll:SetContentHeight(W.StackRows(body, rows))
+    end
+
+    function page:Reload()
+        if not ns.Mythic then
+            error("Mythic.lua is not loaded. Check that it is listed in LunRollHistory.toc.", 0)
+        end
+        local playerName = (select(1, UnitName("player")))
+        local order, byMap, totals = ns.Mythic:Compute(playerName)
+        self.buckets, self.byMap, self.totals = order, byMap, totals
+
+        if self.selectedMap and not byMap[self.selectedMap] then self.selectedMap = nil end
+
+        -- Lay out once before populating, so the grid has a real width to
+        -- divide into columns rather than the zero it reports before anchoring.
+        self:Layout()
+        gridRow:Populate(order)
+
+        local specName, specID = ns.Mythic:CurrentSpecName()
+        gridRow.hint:SetText(#order > 0
+            and string.format("%d dungeons this season", #order)
+            or "No season dungeon list available")
+
+        local bucket = self.selectedMap and byMap[self.selectedMap]
+        local scope = bucket or totals
+        local label = bucket and bucket.name or "All dungeons"
+
+        if bucket then
+            runsRow.title:SetText("Runs in " .. bucket.name)
+        else
+            runsRow.title:SetText("Runs")
+        end
+
+        if (scope.runs or 0) == 0 then
+            chestRow:Set("-", nil, "No completed runs recorded here yet.")
+            runsRow:Set("", nil, bucket
+                and "Click another dungeon, or run this one."
+                or "Complete a Mythic+ dungeon and the chest loot will be recorded automatically.")
+            itemsRow:Populate(nil)
+            itemsRow.empty:SetText("Nothing recorded yet.")
+            itemsRow.empty:Show()
+            self:Layout()
+            return
+        end
+        itemsRow.empty:Hide()
+
+        if scope.enough and scope.luck then
+            local pct = math.floor(scope.luck + 0.5)
+            chestRow:Set(string.format("%d of %.1f", scope.mine, scope.expected), scope.luck,
+                string.format("%s You have taken %d of the %d %s the chest handed out.",
+                    pct >= 50
+                        and string.format("Luckier than %d%% of what chance would give you.", pct)
+                        or string.format("Unluckier than %d%% of what chance would give you.", 100 - pct),
+                    scope.mine, scope.groupItems,
+                    scope.groupItems == 1 and "item" or "items"))
+        else
+            chestRow:Set(string.format("%d of %.1f", scope.mine, scope.expected), nil,
+                string.format("Only %d %s recorded. %d needed before a rating means anything.",
+                    scope.runs, scope.runs == 1 and "run" or "runs", ns.Mythic.MIN_RUNS))
+        end
+
+        local timedPct = (scope.runs > 0) and (scope.timed / scope.runs * 100) or 0
+        local runsText = string.format("%d completed, %d timed (%d%%).",
+            scope.runs, scope.timed, math.floor(timedPct + 0.5))
+        if bucket and bucket.avgLevel > 0 then
+            runsText = runsText .. string.format(" Average key level %.1f.", bucket.avgLevel)
+        end
+        if (scope.warbound or 0) > 0 then
+            runsText = runsText .. string.format(" %d warbound %s.",
+                scope.warbound, scope.warbound == 1 and "drop" or "drops")
+        end
+        runsRow:Set("", nil, runsText)
+
+        itemsRow.title:SetText("Loot table" .. (bucket and (" - " .. bucket.abbr) or ""))
+        if bucket then
+            itemsRow:Populate(bucket, specID)
+            if itemsRow.usedFilter and specName then
+                itemsRow.hint:SetText("Filtered to " .. specName)
+            elseif specName then
+                itemsRow.hint:SetText("Journal unavailable, showing observed drops only")
+            else
+                itemsRow.hint:SetText("")
+            end
+            if (itemsRow.shown or 0) == 0 then
+                itemsRow.empty:SetText("Nothing recorded here, and the journal returned no loot table.")
+                itemsRow.empty:Show()
+            else
+                itemsRow.empty:Hide()
+            end
+        else
+            itemsRow:Populate(nil)
+            itemsRow.hint:SetText("")
+            itemsRow.empty:SetText("Pick a dungeon above to see its loot table.")
+            itemsRow.empty:Show()
+        end
+
+        self:Layout()
+    end
+
+    page.scroll = scroll
+    page.rows = rows
+    page.grid = gridRow
+    return page
+end
+
+--------------------------------------------------------------------------------
 -- Page: Capture settings
 --------------------------------------------------------------------------------
 local function CreateCapturePage(parent)
@@ -629,6 +1266,9 @@ local function CreateCapturePage(parent)
     AddToggle("Only record while grouped",
         "Ignores everything looted while solo.",
         "groupOnly")
+    AddToggle("Sweep on open",
+        "Sweeps the history every time you open the addon window.",
+        "sweepOnOpen")
 
     local QUALITY = {
         { q = 0, name = "Everything" },
@@ -723,7 +1363,7 @@ local function CreateCapturePage(parent)
     function sliderRow:UpdateEstimate()
         local bytes = ns:EstimateBytes(ns.MAX_ENTRIES)
         local text = string.format(
-            "About %s of SavedVariables when full. (THIS IS STORED IN YOUR RAM) written on logout. Import to SQLite regularly and the database outlives the window.",
+            "About %s of SavedVariables when full, written on logout. Import to SQLite regularly and the database outlives the window.",
             ns:FormatBytes(bytes))
         self.desc:SetText("Oldest entries are dropped past this. " .. text)
         if bytes > 512 * 1024 * 1024 then
@@ -995,6 +1635,55 @@ local function BuildConfirm(parent)
 end
 
 --------------------------------------------------------------------------------
+-- Page error surface
+--------------------------------------------------------------------------------
+-- WoW swallows errors thrown inside script handlers when Lua error display is
+-- off, and a page that throws part-way through Reload leaves its rows
+-- unanchored: a completely blank panel with nothing to go on. Reloads run
+-- inside pcall and any failure is shown here instead.
+local function BuildErrorPanel(parent)
+    local panel = W.Panel(parent, { color = C.row, borderColor = C.border })
+    panel:SetPoint("TOPLEFT", 0, 0)
+    panel:SetPoint("TOPRIGHT", 0, 0)
+    panel:SetHeight(150)
+
+    panel.title = W.Text(panel, "This page failed to draw", 13, C.bad, nil, "display")
+    panel.title:SetPoint("TOPLEFT", 14, -14)
+
+    panel.body = W.Text(panel, "", 11, C.textDim)
+    panel.body:SetPoint("TOPLEFT", panel.title, "BOTTOMLEFT", 0, -10)
+    panel.body:SetPoint("RIGHT", panel, "RIGHT", -14, 0)
+    panel.body:SetJustifyH("LEFT")
+    panel.body:SetWordWrap(true)
+
+    panel.hint = W.Text(panel,
+        "Run /lrh diag and send the output along with this message.", 11, C.textFaint)
+    panel.hint:SetPoint("BOTTOMLEFT", 14, 12)
+    panel:Hide()
+    return panel
+end
+
+-- Runs a page reload, surfacing anything it throws rather than losing it.
+local function SafeReload(page)
+    if not page or not page.Reload then return true end
+    local ok, err = pcall(page.Reload, page)
+    if ok then
+        if page.errorPanel then page.errorPanel:Hide() end
+        return true
+    end
+
+    ns.lastPageError = tostring(err)
+    if not page.errorPanel then
+        page.errorPanel = BuildErrorPanel(page)
+    end
+    page.errorPanel.body:SetText(tostring(err))
+    page.errorPanel:Show()
+    page.errorPanel:Raise()
+    ns:Print("|cffff6666Page error:|r", tostring(err))
+    return false
+end
+
+--------------------------------------------------------------------------------
 -- Window assembly
 --------------------------------------------------------------------------------
 local PAGES = {
@@ -1004,6 +1693,8 @@ local PAGES = {
       subtitle = "Who rolls, who wins, and how the dice have actually been falling." },
     { key = "luck",       label = "Am I Unlucky?",    title = "Am I Unlucky?",
       subtitle = "Your rolls measured against what chance would have given you." },
+    { key = "mplus",      label = "Mythic+",          title = "Mythic+",
+      subtitle = "End-of-run chest loot, by dungeon." },
     { key = "capture",    label = "Capture Settings", title = "Capture Settings",
       subtitle = "What gets written to the history.", section = "SETUP" },
     { key = "appearance", label = "Appearance",       title = "Appearance",
@@ -1018,6 +1709,7 @@ local BUILDERS = {
     history    = CreateHistoryPage,
     stats      = CreateStatsPage,
     luck       = CreateLuckPage,
+    mplus      = CreateMythicPage,
     capture    = CreateCapturePage,
     appearance = CreateAppearancePage,
     export     = CreateExportPage,
@@ -1280,7 +1972,7 @@ function UI:Select(key)
         end
     end
     LayoutTabs(page)
-    page:Reload()
+    SafeReload(page)
     page:Show()
     self:UpdateStatus()
 end
@@ -1297,18 +1989,27 @@ function UI:UpdateStatus()
         end
     end
     frame.sideStatus:SetText(string.format("v%s\n%d entries  |  %d rolls",
-        ns.VERSION or "1.0.1", entries, rolls))
+        ns.VERSION or "1.0.0", entries, rolls))
 end
 
 function UI:Refresh()
     if not frame or not frame:IsShown() then return end
     local page = frame.pages[frame.current]
-    if page and page.Reload then page:Reload() end
+    SafeReload(page)
     self:UpdateStatus()
 end
 
 function UI:Show(key)
     if not frame then BuildWindow() end
+
+    -- Re-read the client's loot history on open. Rolls that resolve while the
+    -- window is shut, or while events were being missed, are picked up here
+    -- rather than being lost. On by default; the Capture Settings page can
+    -- turn it off.
+    if LunRollHistoryDB and LunRollHistoryDB.settings.sweepOnOpen and ns.SweepAll then
+        pcall(ns.SweepAll)
+    end
+
     frame:Show()
     self:Select(key or frame.current or "history")
 end

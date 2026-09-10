@@ -152,6 +152,94 @@ function ns:PassesLootFilter(link, itemID)
     return true
 end
 
+-- Repairs a log that already contains duplicates, from a build that appended a
+-- fresh record on every sweep. Drops sharing an item and an identical set of
+-- roll values are the same drop; their rolls are merged and the extra records
+-- dropped.
+function ns:DeduplicateLog()
+    local db = LunRollHistoryDB
+    if not db then return 0, 0 end
+
+    local function RollIdentity(r)
+        return r.key or ((r.guid or r.name or "?") .. ":" .. tostring(r.roll))
+    end
+
+    local byFingerprint, kept = {}, {}
+    local removedDrops, mergedRolls = 0, 0
+
+    for i = 1, #db.log do
+        local e = db.log[i]
+        local fp = (e.t == "drop" and e.itemID) and ns.DropFingerprint(e.itemID, e.rolls) or nil
+        local first = fp and byFingerprint[fp]
+
+        if first then
+            local existing = {}
+            first.rolls = first.rolls or {}
+            for _, r in ipairs(first.rolls) do existing[RollIdentity(r)] = r end
+
+            for _, r in ipairs(e.rolls or {}) do
+                local prior = existing[RollIdentity(r)]
+
+                -- A copy recorded while the player names were unreadable keys
+                -- off a placeholder. Match it on the roll value instead, or the
+                -- repair leaves behind the very duplicates it came to remove.
+                if not prior and not r.guid and not r.name and r.roll then
+                    for _, candidate in ipairs(first.rolls) do
+                        if candidate.roll == r.roll then prior = candidate break end
+                    end
+                end
+
+                if prior then
+                    -- Keep the richer of the two records.
+                    prior.name  = prior.name or r.name
+                    prior.realm = prior.realm or r.realm
+                    prior.class = prior.class or r.class
+                    prior.guid  = prior.guid or r.guid
+                    prior.state = prior.state or r.state
+                    prior.key   = prior.key or r.key
+                    if r.winner then prior.winner = true end
+                    mergedRolls = mergedRolls + 1
+                else
+                    first.rolls[#first.rolls + 1] = r
+                    existing[RollIdentity(r)] = r
+                end
+            end
+
+            first.encName = first.encName or e.encName
+            first.inst    = first.inst or e.inst
+            first.diffID  = first.diffID or e.diffID
+            first.winner  = first.winner or e.winner
+            first.key     = first.key or e.key
+            removedDrops = removedDrops + 1
+        else
+            if fp then byFingerprint[fp] = e end
+            kept[#kept + 1] = e
+        end
+    end
+
+    db.log = kept
+    ns.ResetTransientState()
+    return removedDrops, mergedRolls
+end
+
+-- How many duplicate drops are sitting in the log right now, without changing
+-- anything. Reported by /lrh diag.
+function ns:CountDuplicates()
+    local db = LunRollHistoryDB
+    if not db then return 0 end
+    local seen, duplicates = {}, 0
+    for i = 1, #db.log do
+        local e = db.log[i]
+        if e.t == "drop" and e.itemID then
+            local fp = ns.DropFingerprint(e.itemID, e.rolls)
+            if fp then
+                if seen[fp] then duplicates = duplicates + 1 else seen[fp] = true end
+            end
+        end
+    end
+    return duplicates
+end
+
 -- Applies the current filter to entries already on record.
 function ns:PruneLog()
     local db = LunRollHistoryDB
@@ -217,6 +305,63 @@ end
 -- a new one for every incoming roll.
 local dropRecords = {}
 
+-- Content key -> record, so a drop already in the log is found again after a
+-- reload, when the session-scoped IDs have all been renumbered.
+local keyIndex
+
+-- A drop identified without reference to where the player is standing now.
+-- The encounter name is only knowable while the encounter is the current one,
+-- so a key built from live context stops matching the moment you leave the
+-- instance, which is precisely when a manual sweep tends to happen.
+-- Roll values only, deliberately. Including who rolled looks more precise but
+-- is less reliable: a name that comes back secret changes the fingerprint, so
+-- the same drop stops matching itself and gets recorded twice. Roll values are
+-- the field that survives.
+local function Fingerprint(itemID, rolls)
+    if not itemID or type(rolls) ~= "table" or #rolls == 0 then return nil end
+    local values = {}
+    for _, r in ipairs(rolls) do
+        if r.roll then values[#values + 1] = r.roll end
+    end
+    if #values == 0 then return nil end
+    table.sort(values)
+    return tostring(itemID) .. "|" .. table.concat(values, ",")
+end
+ns.DropFingerprint = Fingerprint
+
+local fingerprintIndex
+
+local function FingerprintIndex()
+    if fingerprintIndex then return fingerprintIndex end
+    fingerprintIndex = {}
+    local db = LunRollHistoryDB
+    if db then
+        local from = math.max(1, #db.log - (ns.MAX_SCAN or 100000) + 1)
+        for i = from, #db.log do
+            local e = db.log[i]
+            if e.t == "drop" and e.itemID then
+                local fp = Fingerprint(e.itemID, e.rolls)
+                if fp then fingerprintIndex[fp] = e end
+            end
+        end
+    end
+    return fingerprintIndex
+end
+
+local function KeyIndex()
+    if keyIndex then return keyIndex end
+    keyIndex = {}
+    local db = LunRollHistoryDB
+    if db then
+        local from = math.max(1, #db.log - (ns.MAX_SCAN or 100000) + 1)
+        for i = from, #db.log do
+            local e = db.log[i]
+            if e.t == "drop" and e.key then keyIndex[e.key] = e end
+        end
+    end
+    return keyIndex
+end
+
 local function ReadDrop(encounterID, lootListID)
     if not LunRollHistoryDB or not LunRollHistoryDB.settings.captureLootHistory then return end
     if not ns:ShouldCapture() then return end
@@ -228,16 +373,50 @@ local function ReadDrop(encounterID, lootListID)
         return
     end
 
-    local key = tostring(encounterID) .. ":" .. tostring(lootListID)
-    local rec = dropRecords[key]
-    if not rec then
-        rec = ns:Append({ t = "drop", enc = ns:SafeNum(encounterID, nil),
-                          list = ns:SafeNum(lootListID, nil) })
-        dropRecords[key] = rec
-    end
+    local sessionKey = tostring(encounterID) .. ":" .. tostring(lootListID)
+    local rec = dropRecords[sessionKey]
 
     local link, itemID, itemName = ns:ParseItemLink(
         ns:Field(info, "itemHyperlink", "itemLink", "hyperlink"))
+
+    -- Sweeping the same history twice, or reloading mid-raid, used to append a
+    -- second copy of every drop. Looking the content key up first makes a
+    -- sweep idempotent, which is what allows sweeping often.
+    if not rec then
+        local candidate = ns:DropKey({
+            itemID = itemID, item = itemName,
+            diffID = ns.context.difficultyID,
+            encName = ns.context.encounterName, inst = ns.context.instance,
+        })
+        if candidate then
+            rec = KeyIndex()[candidate]
+        end
+
+        -- Context key missed. Fall back to the roll set, which every sweep of
+        -- the same drop reproduces identically no matter where the player is.
+        if not rec then
+            local incoming = {}
+            local infos = ns:Field(info, "rollInfos", "playerRollInfos", "rolls")
+            if type(infos) == "table" then
+                for i = 1, #infos do
+                    local name, _, _, guid = ResolvePlayer(infos[i])
+                    incoming[#incoming + 1] = {
+                        name = name, guid = guid,
+                        roll = ns:SafeNum(ns:Field(infos[i], "roll", "rollValue"), nil),
+                    }
+                end
+            end
+            local fp = Fingerprint(itemID, incoming)
+            if fp then rec = FingerprintIndex()[fp] end
+        end
+
+        if not rec then
+            rec = ns:Append({ t = "drop", enc = ns:SafeNum(encounterID, nil),
+                              list = ns:SafeNum(lootListID, nil) })
+        end
+        dropRecords[sessionKey] = rec
+    end
+
     rec.link      = link
     rec.itemID    = itemID
     rec.item      = itemName
@@ -245,14 +424,24 @@ local function ReadDrop(encounterID, lootListID)
     rec.allPassed = ns:SafeBool(ns:Field(info, "allPassed"))
     rec.updated   = GetServerTime()
 
+    rec.key = ns:DropKey(rec)
+    if rec.key then KeyIndex()[rec.key] = rec end
+
+    -- Rolls are merged by key rather than replaced wholesale, so a client that
+    -- saw only part of the roster does not wipe out what another pass caught.
     local rollInfos = ns:Field(info, "rollInfos", "playerRollInfos", "rolls")
-    local rolls = {}
+    local existing = {}
+    rec.rolls = rec.rolls or {}
+    for _, r in ipairs(rec.rolls) do
+        if r.key then existing[r.key] = r end
+    end
+
     if type(rollInfos) == "table" then
         for i = 1, #rollInfos do
             local ri = rollInfos[i]
             local name, realm, class, guid = ResolvePlayer(ri)
             local isWinner = ns:SafeBool(ns:Field(ri, "isWinner", "winner"))
-            rolls[#rolls + 1] = {
+            local entry = {
                 name   = name,
                 realm  = realm,
                 class  = class,
@@ -261,10 +450,39 @@ local function ReadDrop(encounterID, lootListID)
                 state  = DescribeRollState(ns:Field(ri, "state", "rollState", "rollType")),
                 winner = isWinner,
             }
+            entry.key = ns:RollKey(rec.key, entry)
+
+            local prior = entry.key and existing[entry.key]
+
+            -- A roll whose player we cannot read at all keys off a placeholder,
+            -- which would not match the same roll seen with a readable name and
+            -- would show up as a phantom second roller. Fall back to matching on
+            -- the roll value within this drop.
+            if not prior and not entry.guid and not entry.name and entry.roll then
+                for _, r in ipairs(rec.rolls) do
+                    if r.roll == entry.roll then prior = r break end
+                end
+            end
+
+            if prior then
+                -- Fill gaps without discarding anything already known.
+                prior.name   = prior.name or entry.name
+                prior.realm  = prior.realm or entry.realm
+                prior.class  = prior.class or entry.class
+                prior.guid   = prior.guid or entry.guid
+                prior.state  = prior.state or entry.state
+                if entry.winner then prior.winner = true end
+            else
+                rec.rolls[#rec.rolls + 1] = entry
+                if entry.key then existing[entry.key] = entry end
+            end
             if isWinner and name then rec.winner = name end
         end
     end
-    rec.rolls = rolls
+    local rolls = rec.rolls
+
+    local fp = Fingerprint(rec.itemID, rec.rolls)
+    if fp then FingerprintIndex()[fp] = rec end
     ns:Debug("drop updated", rec.item or "?", #rolls, "rolls")
 end
 
@@ -323,9 +541,72 @@ ns:On("START_LOOT_ROLL", function(rollID)
                 link = parsed, itemID = itemID, item = itemName })
 end)
 
-ns:On("LOOT_ROLLS_COMPLETE", function()
-    SweepAll()
+--------------------------------------------------------------------------------
+-- Sweep scheduling
+--------------------------------------------------------------------------------
+-- The client holds loot history for a while and then discards it. Reading it
+-- only when the window happens to be opened means anything missed while the
+-- window was shut can be gone by the time anyone looks. These triggers read it
+-- close to when it appears instead.
+--
+-- Repeating a sweep is free now that drops merge on their content key, so the
+-- schedule can be generous rather than careful.
+local lastSweep = 0
+local SWEEP_THROTTLE = 2
+
+local function SweepNow()
+    local now = GetServerTime()
+    if now - lastSweep < SWEEP_THROTTLE then return end
+    lastSweep = now
+    -- Through the public entry point, so anything that replaces or wraps the
+    -- sweep is honoured rather than quietly bypassed.
+    pcall(ns.SweepAll)
+end
+ns.SweepNow = SweepNow
+
+-- Loot history settles over several seconds after a kill, so one read is not
+-- enough; these fire at spread intervals rather than all at once.
+local function SweepSoon(delays)
+    if not (C_Timer and C_Timer.After) then
+        SweepNow()
+        return
+    end
+    for _, delay in ipairs(delays) do
+        C_Timer.After(delay, function()
+            lastSweep = 0        -- scheduled sweeps bypass the throttle
+            SweepNow()
+        end)
+    end
+end
+ns.SweepSoon = SweepSoon
+
+local function InGroupContent()
+    local ok, inInstance = pcall(IsInInstance)
+    if not ok or not inInstance then return false end
+    local okGroup, grouped = pcall(IsInGroup)
+    return okGroup and grouped
+end
+
+ns:On("LOOT_ROLLS_COMPLETE", function() SweepNow() end)
+ns:On("ENCOUNTER_END", function() SweepSoon({ 2, 6, 15 }) end)
+ns:On("BOSS_KILL", function() SweepSoon({ 3, 10 }) end)
+ns:On("LOOT_CLOSED", function() SweepSoon({ 1 }) end)
+
+-- Leaving combat is when anything missed during the pull becomes readable.
+ns:On("PLAYER_REGEN_ENABLED", function()
+    if InGroupContent() then SweepSoon({ 1, 5 }) end
 end)
+
+-- Backstop for events that never arrive at all.
+local ticker
+local function StartTicker()
+    if ticker or not (C_Timer and C_Timer.NewTicker) then return end
+    local ok, handle = pcall(C_Timer.NewTicker, 30, function()
+        if InGroupContent() then SweepNow() end
+    end)
+    if ok then ticker = handle end
+end
+ns:On("PLAYER_ENTERING_WORLD", StartTicker)
 
 --------------------------------------------------------------------------------
 -- 3. Manual /roll
@@ -403,11 +684,13 @@ ns:On("CHAT_MSG_LOOT", function(msg)
                     local short, r = player:match("^(.-)%-(.+)$")
                     if short then player, realm = short, r end
                 end
-                ns:Append({
+                local rec = ns:Append({
                     t = "loot", name = player, realm = realm,
                     link = parsed, itemID = itemID, item = itemName,
                     qty = tonumber(qty) or 1,
                 })
+                -- If a Mythic+ run just finished, this may be chest loot.
+                if ns.Mythic then ns.Mythic:NoteLoot(rec) end
             end
             return
         end
@@ -417,8 +700,19 @@ end)
 --------------------------------------------------------------------------------
 -- Lifecycle
 --------------------------------------------------------------------------------
+-- Full reset. Only for when the log itself is thrown away: the loot-history
+-- session IDs stay valid for the whole client session, so discarding this map
+-- on a zone change made every drop look new again on the next sweep.
 function ns.ResetTransientState()
     dropRecords = {}
+    keyIndex = nil
+    fingerprintIndex = nil
+end
+
+-- Zoning invalidates the derived indexes but not the session map.
+function ns.InvalidateIndexes()
+    keyIndex = nil
+    fingerprintIndex = nil
 end
 
 local prevOnDBReady = ns.OnDBReady

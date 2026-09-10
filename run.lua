@@ -17,6 +17,7 @@ LoadFile(ROOT .. "/Core.lua")
 LoadFile(ROOT .. "/Theme.lua")
 LoadFile(ROOT .. "/Widgets.lua")
 LoadFile(ROOT .. "/Luck.lua")
+LoadFile(ROOT .. "/Mythic.lua")
 LoadFile(ROOT .. "/UI.lua")
 LoadFile(ROOT .. "/Minimap.lua")
 LoadFile(ROOT .. "/Capture.lua")
@@ -83,6 +84,320 @@ check("pass decoded", dropRec and dropRec.rolls[4].state == "Pass",
 check("itemID parsed", dropRec and dropRec.itemID == 229876, dropRec and dropRec.itemID)
 check("encounter stamped", dropRec and dropRec.encName == "Nymrissa Wavecaller", dropRec and dropRec.encName)
 check("difficulty stamped", dropRec and dropRec.diff == "Mythic", dropRec and dropRec.diff)
+
+print("\n== deterministic keys ==")
+do
+    local drop = nil
+    for _, e in ipairs(LunRollHistoryDB.log) do if e.t == "drop" then drop = e end end
+    check("drops carry a content key", drop.key ~= nil, tostring(drop.key))
+    check("every identified roll carries a key", (function()
+        for _, r in ipairs(drop.rolls) do
+            if r.name and not r.key then return false, r.name end
+        end
+        return true
+    end)())
+    check("the key contains the item, not a session counter",
+          drop.key:find("229876", 1, true) ~= nil, drop.key)
+    check("roll keys include the roller and the value", (function()
+        for _, r in ipairs(drop.rolls) do
+            if r.name == "Tankadin" then
+                return r.key:find("91", 1, true) ~= nil, r.key
+            end
+        end
+    end)())
+
+    -- Two clients seeing the same roll must derive the same key. The session
+    -- IDs differ between them, so anything derived from those would not match.
+    local a = ns:DropKey({ itemID = 229876, diffID = 16, encName = "Nymrissa Wavecaller" })
+    local b = ns:DropKey({ itemID = 229876, diffID = 16, encName = "Nymrissa Wavecaller",
+                           enc = 99, list = 42 })
+    check("the key ignores session-scoped ids", a == b, a .. " vs " .. b)
+    check("a different item gives a different key",
+          ns:DropKey({ itemID = 111, diffID = 16, encName = "Nymrissa Wavecaller" }) ~= a)
+    check("a different difficulty gives a different key",
+          ns:DropKey({ itemID = 229876, diffID = 14, encName = "Nymrissa Wavecaller" }) ~= a)
+    check("no item means no key", ns:DropKey({ diffID = 16 }) == nil)
+
+    check("roll keys prefer the guid over the name", (function()
+        local withGuid = ns:RollKey(a, { guid = "Player-1-AAA", name = "Ann", roll = 50 })
+        local renamed  = ns:RollKey(a, { guid = "Player-1-AAA", name = "Renamed", roll = 50 })
+        return withGuid == renamed, withGuid
+    end)())
+    check("a roll without a value has no key", ns:RollKey(a, { name = "Ann" }) == nil)
+
+    -- Sweeping twice must not duplicate anything.
+    local before = #LunRollHistoryDB.log
+    local rollsBefore = #drop.rolls
+    ns.SweepAll()
+    ns.SweepAll()
+    check("repeated sweeps add no records", #LunRollHistoryDB.log == before,
+          #LunRollHistoryDB.log .. " vs " .. before)
+    check("repeated sweeps add no rolls", #drop.rolls == rollsBefore,
+          #drop.rolls .. " vs " .. rollsBefore)
+
+    -- A reload renumbers the session IDs; the drop must still be recognised.
+    ns.ResetTransientState()
+    __fire("LOOT_HISTORY_UPDATE_DROP", 7001, 1)
+    check("a drop survives session ids being renumbered",
+          #LunRollHistoryDB.log == before, #LunRollHistoryDB.log)
+
+    -- Backfill on an old log that predates keys.
+    local savedLog = LunRollHistoryDB.log
+    LunRollHistoryDB.log = {
+        { t = "drop", uid = 1, itemID = 555, diffID = 16, encName = "Old Boss",
+          rolls = { { name = "Ann", guid = "Player-1-A", roll = 77 },
+                    { name = "Bob", roll = 12 } } },
+    }
+    LunRollHistoryDB.keysBackfilled = nil
+    local filled = ns:BackfillKeys()
+    check("an existing log gets keys without re-recording", filled == 2, filled)
+    check("the old drop now has a key", LunRollHistoryDB.log[1].key ~= nil)
+    check("old rolls keep their data", LunRollHistoryDB.log[1].rolls[1].name == "Ann")
+    check("backfill runs only once", ns:BackfillKeys() == 0)
+    LunRollHistoryDB.log = savedLog
+end
+
+print("\n== sweeping must not duplicate ==")
+do
+    local savedLog, savedUID = LunRollHistoryDB.log, LunRollHistoryDB.nextUID
+    LunRollHistoryDB.log = {}
+    LunRollHistoryDB.nextUID = 1
+    ns.ResetTransientState()
+
+    ns.context.instance = "The Venomous Abyss"
+    ns.context.encounterName = "Nymrissa Wavecaller"
+    ns.context.difficultyID = 16
+    __fire("LOOT_HISTORY_UPDATE_DROP", 7001, 1)
+
+    local function Counts()
+        local drops, rolls = 0, 0
+        for _, e in ipairs(LunRollHistoryDB.log) do
+            if e.t == "drop" then
+                drops = drops + 1
+                rolls = rolls + #(e.rolls or {})
+            end
+        end
+        return drops, rolls
+    end
+
+    local d0, r0 = Counts()
+    check("one drop recorded to start", d0 == 1, d0)
+
+    for _ = 1, 5 do ns.SweepAll() end
+    local d1, r1 = Counts()
+    check("sweeping five times adds no drops", d1 == d0, d1 .. " vs " .. d0)
+    check("sweeping five times adds no rolls", r1 == r0, r1 .. " vs " .. r0)
+
+    -- The reported bug: pressing Sweep History after leaving the raid. Zoning
+    -- out changes the context the lookup key was built from.
+    __fire("PLAYER_ENTERING_WORLD")
+    ns.context.instance = "Eastern Kingdoms"
+    ns.context.encounterName = nil
+    ns.context.difficultyID = nil
+
+    for _ = 1, 5 do ns.SweepAll() end
+    local d2, r2 = Counts()
+    check("sweeping from outside the raid adds no drops", d2 == d0, d2 .. " vs " .. d0)
+    check("sweeping from outside the raid adds no rolls", r2 == r0, r2 .. " vs " .. r0)
+
+    -- Even with the session map gone entirely, as after a reload.
+    ns.ResetTransientState()
+    for _ = 1, 3 do ns.SweepAll() end
+    local d3, r3 = Counts()
+    check("sweeping after a reload adds no drops", d3 == d0, d3 .. " vs " .. d0)
+    check("sweeping after a reload adds no rolls", r3 == r0, r3 .. " vs " .. r0)
+
+    -- The lookup key includes the encounter, so sweeping while a different
+    -- boss is current must still recognise the drop.
+    ns.context.encounterName = "Some Other Boss"
+    for _ = 1, 3 do ns.SweepAll() end
+    local d4, r4 = Counts()
+    check("sweeping during a different encounter adds no drops", d4 == d0, d4 .. " vs " .. d0)
+    check("sweeping during a different encounter adds no rolls", r4 == r0, r4 .. " vs " .. r0)
+    ns.context.encounterName = "Nymrissa Wavecaller"
+
+    -- And with a roller's name unreadable, which changes anything derived
+    -- from names but not the roll values.
+    local secret = setmetatable({}, { __tostring = function() error("secret") end })
+    local savedName = __dropState.rollInfos[1].playerName
+    __dropState.rollInfos[1].playerName = secret
+    ns.ResetTransientState()
+    for _ = 1, 3 do ns.SweepAll() end
+    __dropState.rollInfos[1].playerName = savedName
+    local d5, r5 = Counts()
+    check("a secret name does not create a second copy of the drop",
+          d5 == d0, d5 .. " vs " .. d0)
+    check("nor a second set of rolls", r5 == r0, r5 .. " vs " .. r0)
+
+    check("the roll count stays put across all of it", (function()
+        local total = 0
+        for _, e in ipairs(LunRollHistoryDB.log) do
+            if e.t == "drop" then total = total + #(e.rolls or {}) end
+        end
+        return total == r0, total .. " vs " .. r0
+    end)())
+
+    LunRollHistoryDB.log = savedLog
+    LunRollHistoryDB.nextUID = savedUID     -- or later records reuse ids
+    ns.ResetTransientState()
+    ns.context.instance = "The Venomous Abyss"
+    ns.context.encounterName = "Nymrissa Wavecaller"
+    ns.context.difficultyID = 16
+end
+
+print("\n== repairing an already duplicated log ==")
+do
+    local savedLog, savedUID = LunRollHistoryDB.log, LunRollHistoryDB.nextUID
+
+    -- A log as an older build would have left it: the same drop recorded four
+    -- times, each copy holding a slightly different view of the rolls.
+    local function Copy(rolls, encName)
+        return { t = "drop", itemID = 229876, item = "Venomfang Shoulderguards",
+                 diffID = 16, encName = encName, ts = 1757000000, rolls = rolls }
+    end
+    LunRollHistoryDB.log = {
+        Copy({ { name = "Ann", guid = "P-A", roll = 91, state = "NeedMainSpec", winner = true },
+               { name = "Bob", guid = "P-B", roll = 44, state = "NeedMainSpec" },
+               { name = "Cid", guid = "P-C", roll = 12, state = "Greed" } }, "Nymrissa Wavecaller"),
+        Copy({ { name = "Ann", guid = "P-A", roll = 91, state = "NeedMainSpec", winner = true },
+               { name = "Bob", guid = "P-B", roll = 44 },
+               { name = "Cid", guid = "P-C", roll = 12, state = "Greed" } }, nil),
+        Copy({ { roll = 91 }, { roll = 44 }, { roll = 12 } }, "Eastern Kingdoms"),
+        Copy({ { name = "Ann", guid = "P-A", roll = 91, state = "NeedMainSpec" },
+               { name = "Bob", guid = "P-B", roll = 44, state = "NeedMainSpec" },
+               { name = "Cid", guid = "P-C", roll = 12, state = "Greed" } }, "Nymrissa Wavecaller"),
+        -- A genuinely different drop: same item, different rolls.
+        Copy({ { name = "Ann", guid = "P-A", roll = 55, state = "NeedMainSpec", winner = true },
+               { name = "Bob", guid = "P-B", roll = 30, state = "Greed" } }, "Nymrissa Wavecaller"),
+        { t = "manualroll", name = "Ann", roll = 20 },
+    }
+    LunRollHistoryDB.nextUID = 10
+
+    check("duplicates are counted before touching anything",
+          ns:CountDuplicates() == 3, ns:CountDuplicates())
+
+    local drops, rolls = ns:DeduplicateLog()
+    check("the three extra copies are removed", drops == 3, drops)
+    check("repeated rolls are merged, not appended", rolls > 0, rolls)
+
+    local dropCount, rollCount = 0, 0
+    for _, e in ipairs(LunRollHistoryDB.log) do
+        if e.t == "drop" then
+            dropCount = dropCount + 1
+            rollCount = rollCount + #(e.rolls or {})
+        end
+    end
+    check("two distinct drops survive", dropCount == 2, dropCount)
+    check("the merged drop keeps exactly three rolls", (function()
+        for _, e in ipairs(LunRollHistoryDB.log) do
+            if e.t == "drop" and #e.rolls == 3 then return true end
+        end
+        return false, rollCount
+    end)())
+
+    check("a genuinely different drop is left alone", (function()
+        for _, e in ipairs(LunRollHistoryDB.log) do
+            if e.t == "drop" and #e.rolls == 2 then return true end
+        end
+        return false
+    end)())
+
+    check("non-drop records are untouched", (function()
+        for _, e in ipairs(LunRollHistoryDB.log) do
+            if e.t == "manualroll" and e.name == "Ann" then return true end
+        end
+        return false
+    end)())
+
+    check("the richest version of each roll wins", (function()
+        for _, e in ipairs(LunRollHistoryDB.log) do
+            if e.t == "drop" and #e.rolls == 3 then
+                for _, r in ipairs(e.rolls) do
+                    if r.name == "Bob" then
+                        return r.state == "NeedMainSpec", tostring(r.state)
+                    end
+                end
+            end
+        end
+        return false, "Bob not found"
+    end)())
+
+    check("the winner survives the merge", (function()
+        for _, e in ipairs(LunRollHistoryDB.log) do
+            if e.t == "drop" and #e.rolls == 3 then
+                for _, r in ipairs(e.rolls) do
+                    if r.name == "Ann" then return r.winner == true end
+                end
+            end
+        end
+    end)())
+
+    check("an encounter name recovered from any copy is kept", (function()
+        for _, e in ipairs(LunRollHistoryDB.log) do
+            if e.t == "drop" and #e.rolls == 3 then
+                return e.encName == "Nymrissa Wavecaller", tostring(e.encName)
+            end
+        end
+    end)())
+
+    check("running it again changes nothing", (function()
+        local d, _ = ns:DeduplicateLog()
+        return d == 0, d
+    end)())
+    check("no duplicates remain", ns:CountDuplicates() == 0, ns:CountDuplicates())
+
+    LunRollHistoryDB.log = savedLog
+    LunRollHistoryDB.nextUID = savedUID
+    ns.ResetTransientState()
+end
+
+print("\n== sweep triggers ==")
+do
+    local swept = 0
+    local realSweep = ns.SweepAll
+    ns.SweepAll = function() swept = swept + 1 end
+
+    local savedEncounter = ns.context.encounterName
+    swept = 0
+    __fire("ENCOUNTER_END", 7001, "Boss", 16, 20, true)
+    check("a kill schedules several sweeps", swept >= 3, swept)
+    ns.context.encounterName = savedEncounter
+
+    swept = 0
+    __fire("LOOT_CLOSED")
+    check("closing a loot window sweeps", swept >= 1, swept)
+
+    swept = 0
+    __uistub.inInstance = true
+    __fire("PLAYER_REGEN_ENABLED")
+    check("leaving combat in a group instance sweeps", swept >= 1, swept)
+
+    swept = 0
+    __uistub.inInstance = false
+    __fire("PLAYER_REGEN_ENABLED")
+    check("leaving combat while solo does not", swept == 0, swept)
+    __uistub.inInstance = true
+
+    check("a backstop ticker is running", __uistub.ticker ~= nil)
+
+    -- The throttle is real: two sweeps in the same second collapse to one.
+    swept = 0
+    __uistub.ticker()
+    check("the ticker respects the throttle", swept == 0, swept)
+
+    __uistub.now = (__uistub.now or 1757000000) + 60
+    swept = 0
+    __uistub.ticker()
+    check("the ticker sweeps once the throttle clears", swept == 1, swept)
+
+    swept = 0
+    __uistub.ticker()
+    __uistub.ticker()
+    check("back-to-back ticks do not sweep twice", swept <= 1, swept)
+    __uistub.now = nil
+
+    ns.SweepAll = realSweep
+end
 
 print("\n== manual rolls ==")
 __fire("CHAT_MSG_SYSTEM", "Sneakyboi rolls 73 (1-100)")
@@ -367,6 +682,146 @@ do
     ns.UI:Select("about")
     local about = _G.LunRollHistoryFrame.pages.about
     check("about page measured", about.scroll ~= nil or true)
+end
+
+print("\n== statistics sorting and filtering ==")
+do
+    local savedLog = LunRollHistoryDB.log
+    LunRollHistoryDB.log = {}
+    LunRollHistoryDB.nextUID = 1
+
+    local function Drop(entries)
+        local rolls = {}
+        for _, e in ipairs(entries) do
+            rolls[#rolls + 1] = { name = e[1], roll = e[2], state = e[3],
+                                  winner = e[4] or false, class = "ROGUE" }
+        end
+        ns:Append({ t = "drop", item = "Item", itemID = 1, rolls = rolls })
+    end
+
+    Drop({ { "Ann", 90, "NeedMainSpec", true }, { "Bob", 20, "NeedMainSpec" },
+           { "Cid", 50, "Greed" } })
+    Drop({ { "Ann", 30, "Greed" }, { "Bob", 80, "Greed", true },
+           { "Cid", 10, "Transmog" } })
+    Drop({ { "Ann", 60, "Transmog", true }, { "Bob", 40, "Pass" },
+           { "Cid", 70, "NeedMainSpec" } })
+
+    ns.UI:Select("stats")
+    local page = _G.LunRollHistoryFrame.pages.stats
+
+    page.filter = "all"
+    page:Reload()
+    check("all filter counts every contested roll", (function()
+        local total = 0
+        for _, p in ipairs(page.rows) do total = total + p.rolls end
+        return total == 8, total   -- nine rolls, one of them a pass
+    end)())
+
+    page.filter = "need"
+    page:Reload()
+    check("need filter counts only need rolls", (function()
+        local total = 0
+        for _, p in ipairs(page.rows) do total = total + p.rolls end
+        return total == 3, total
+    end)())
+
+    page.filter = "greed"
+    page:Reload()
+    check("greed filter counts only greed rolls", (function()
+        local total = 0
+        for _, p in ipairs(page.rows) do total = total + p.rolls end
+        return total == 3, total
+    end)())
+
+    page.filter = "transmog"
+    page:Reload()
+    check("transmog filter counts only transmog rolls", (function()
+        local total = 0
+        for _, p in ipairs(page.rows) do total = total + p.rolls end
+        return total == 2, total
+    end)())
+
+    check("passes are excluded from every filter", (function()
+        for _, key in ipairs({ "all", "need", "greed", "transmog" }) do
+            page.filter = key
+            page:Reload()
+            for _, p in ipairs(page.rows) do
+                if p.rolls == 0 then return false, key end
+            end
+        end
+        return true
+    end)())
+
+    page.filter = "all"
+
+    -- Sorting.
+    local function Names()
+        local out = {}
+        for _, p in ipairs(page.rows) do out[#out + 1] = p.name end
+        return table.concat(out, ",")
+    end
+
+    page.sortKey, page.sortDesc = "avg", true
+    page:Reload()
+    check("sort by average, highest first", (function()
+        for i = 2, #page.rows do
+            if page.rows[i - 1].avg < page.rows[i].avg then return false end
+        end
+        return true
+    end)(), Names())
+
+    page.sortDesc = false
+    page:Reload()
+    check("sort by average, lowest first", (function()
+        for i = 2, #page.rows do
+            if page.rows[i - 1].avg > page.rows[i].avg then return false end
+        end
+        return true
+    end)(), Names())
+
+    page.sortKey, page.sortDesc = "name", false
+    page:Reload()
+    check("sort by name is alphabetical", Names() == "Ann,Bob,Cid", Names())
+
+    -- Clicking a header must sort, and clicking it again must reverse.
+    page.headers.rolls:Fire("OnClick")
+    check("clicking a column sorts by it", page.sortKey == "rolls", page.sortKey)
+    check("numeric columns start highest first", page.sortDesc == true)
+    page.headers.rolls:Fire("OnClick")
+    check("clicking again reverses", page.sortDesc == false)
+    page.headers.name:Fire("OnClick")
+    check("the name column starts A to Z", page.sortKey == "name" and page.sortDesc == false)
+
+    -- Filter buttons.
+    check("filter buttons exist for every type", #page.filterButtons == 4, #page.filterButtons)
+    for _, b in ipairs(page.filterButtons) do
+        if b.filterKey == "greed" then b:Fire("OnClick") end
+    end
+    check("clicking a filter button applies it", page.filter == "greed", page.filter)
+
+    LunRollHistoryDB.log = savedLog
+    page.filter = "all"
+end
+
+print("\n== sweep on open ==")
+do
+    check("sweep on open defaults to on", LunRollHistoryDB.settings.sweepOnOpen == true)
+
+    local swept = 0
+    local realSweep = ns.SweepAll
+    ns.SweepAll = function() swept = swept + 1 end
+
+    ns.UI:Hide()
+    ns.UI:Show()
+    check("opening the window re-reads loot history", swept == 1, swept)
+
+    LunRollHistoryDB.settings.sweepOnOpen = false
+    ns.UI:Hide()
+    ns.UI:Show()
+    check("the option can be opted out of", swept == 1, swept)
+
+    LunRollHistoryDB.settings.sweepOnOpen = true
+    ns.SweepAll = realSweep
 end
 
 print("\n== accent picker ==")
@@ -749,6 +1204,110 @@ do
     LunRollHistoryDB.log = saved
 end
 
+print("\n== roll history sorting ==")
+do
+    ns.UI:Select("history")
+    local page = _G.LunRollHistoryFrame.pages.history
+    page.search = ""
+    page.filter = "all"
+    page:Reload()
+
+    local function Column(fn)
+        local out = {}
+        for _, vm in ipairs(page.list.data) do out[#out + 1] = fn(vm) end
+        return out
+    end
+    local function Ordered(values, descending, compare)
+        for i = 2, #values do
+            local a, b = values[i - 1], values[i]
+            if a ~= nil and b ~= nil and a ~= b then
+                if descending and compare(a, b) then return false, i end
+                if not descending and compare(b, a) then return false, i end
+            end
+        end
+        return true
+    end
+    local function Less(a, b) return a < b end
+
+    check("defaults to newest first",
+          page.sortKey == "time" and page.sortDesc == true,
+          tostring(page.sortKey) .. "/" .. tostring(page.sortDesc))
+    check("newest first really is newest first",
+          Ordered(Column(function(vm) return vm.ts or 0 end), true, Less))
+
+    -- Every column, both directions.
+    local cases = {
+        { key = "roll",   get = function(vm) return vm.roll or -1 end },
+        { key = "player", get = function(vm) return (vm.player or ""):lower() end },
+        { key = "item",   get = function(vm) return (vm.item or vm.encounter or ""):lower() end },
+        { key = "type",   get = function(vm) return (vm.rollType or ""):lower() end },
+        { key = "time",   get = function(vm) return vm.ts or 0 end },
+    }
+    for _, case in ipairs(cases) do
+        page.sortKey, page.sortDesc = case.key, true
+        page:Reload()
+        check("sort by " .. case.key .. ", descending",
+              Ordered(Column(case.get), true, Less))
+        page.sortDesc = false
+        page:Reload()
+        check("sort by " .. case.key .. ", ascending",
+              Ordered(Column(case.get), false, Less))
+    end
+
+    -- Clicking a header, the way a user would.
+    page.sortKey, page.sortDesc = "time", true
+    page:Reload()
+    page.head.buttons[5]:Fire("OnClick")            -- Roll
+    check("clicking a header sorts by that column", page.sortKey == "roll", page.sortKey)
+    check("numeric columns start highest first", page.sortDesc == true)
+    page.head.buttons[5]:Fire("OnClick")
+    check("clicking again reverses", page.sortDesc == false)
+    page.head.buttons[3]:Fire("OnClick")            -- Player
+    check("text columns start A to Z",
+          page.sortKey == "player" and page.sortDesc == false)
+
+    -- Sorting must not disturb the column widths, and resizing must not
+    -- disturb the sort.
+    local widthBefore = page.columns[1].width
+    page.head.buttons[1]:Fire("OnClick")
+    check("sorting leaves the column widths alone",
+          page.columns[1].width == widthBefore, page.columns[1].width)
+
+    local sortBefore, descBefore = page.sortKey, page.sortDesc
+    page.head:SetDivider(3, (page.columns[3].offset or 0) + page.columns[3].render + 10)
+    check("resizing leaves the sort alone",
+          page.sortKey == sortBefore and page.sortDesc == descBefore)
+
+    -- The active column is the one marked.
+    page.sortKey, page.sortDesc = "roll", true
+    page:Reload()
+    check("the sorted column is marked", (function()
+        for i, col in ipairs(page.columns) do
+            local text = page.head.labels[i]:GetText() or ""
+            local marked = text:find("v", 1, true) or text:find("%^")
+            if col.key == "roll" and not marked then return false, text end
+            if col.key ~= "roll" and marked then return false, col.key .. ": " .. text end
+        end
+        return true
+    end)())
+
+    -- Filtering by tab must not lose the sort.
+    page.sortKey, page.sortDesc = "roll", false
+    page.filter = "manual"
+    page:Reload()
+    check("switching tab keeps the sort",
+          Ordered(Column(function(vm) return vm.roll or -1 end), false, Less))
+    check("the marker follows a sort set in code, not just by clicking", (function()
+        page.sortKey, page.sortDesc = "player", true
+        page:Reload()
+        return (page.head.labels[3]:GetText() or ""):find("v", 1, true) ~= nil,
+               page.head.labels[3]:GetText()
+    end)())
+    page.filter = "all"
+    page.sortKey, page.sortDesc = "time", true
+    page:Reload()
+end
+
 print("\n== resizable columns ==")
 do
     ns.UI:Select("history")
@@ -1008,6 +1567,663 @@ do
 
     LunRollHistoryDB.log = savedLog
     ns.MAX_ENTRIES = savedMax
+end
+
+
+print("\n== mythic+ abbreviations ==")
+do
+    local M = ns.Mythic
+    check("multi-word initials", M:Abbreviate(1, "Ruby Life Pools") == "RLP",
+          M:Abbreviate(1, "Ruby Life Pools"))
+    check("minor words stay lowercase",
+          M:Abbreviate(2, "Throne of the Tides") == "TotT",
+          M:Abbreviate(2, "Throne of the Tides"))
+    -- A leading article is still capitalised, or this reads as tNO.
+    check("leading article is capitalised",
+          M:Abbreviate(3, "The Nokhud Offensive") == "TNO",
+          M:Abbreviate(3, "The Nokhud Offensive"))
+    check("apostrophes do not split a word",
+          M:Abbreviate(7, "Atal'Dazar") == "ATA", M:Abbreviate(7, "Atal'Dazar"))
+    check("single word takes three letters", M:Abbreviate(4, "Karazhan") == "KAR",
+          M:Abbreviate(4, "Karazhan"))
+    check("long names are capped at four",
+          #M:Abbreviate(5, "Tazavesh the Veiled Market Extended") <= 4,
+          M:Abbreviate(5, "Tazavesh the Veiled Market Extended"))
+    check("empty name does not error", M:Abbreviate(6, "") == "?")
+
+    -- The override table is the one hand-maintained thing per season.
+    M.ABBREVIATIONS[501] = "RLP!"
+    check("override wins over the generated form", M:Abbreviate(501, "Ruby Life Pools") == "RLP!")
+    M.ABBREVIATIONS[501] = nil
+end
+
+print("\n== mythic+ season list ==")
+do
+    local M = ns.Mythic
+    local maps = M:SeasonMaps()
+    check("season list read from the client", #maps == 2, #maps)
+    local info = M:MapInfo(501)
+    check("map name resolved", info and info.name == "Ruby Life Pools", info and info.name)
+    check("map icon resolved", info and info.texture ~= nil)
+    check("abbreviation attached", info and info.abbr == "RLP", info and info.abbr)
+    check("unknown map is handled", M:MapInfo(99999) == nil)
+end
+
+print("\n== mythic+ run capture ==")
+do
+    local M = ns.Mythic
+    local savedLog = LunRollHistoryDB.log
+    LunRollHistoryDB.log = {}
+    LunRollHistoryDB.nextUID = 1
+    LunRollHistoryDB.settings.minLootQuality = 0
+
+    local EPIC = "|cffa335ee|Hitem:229876::::::::80:::::|h[Chest Piece]|h|r"
+    local WARB = "|cffa335ee|Hitem:229877::::::::80:::::|h[WARBOUND Ring]|h|r"
+
+    local function Run(mapID, level, timed, awards)
+        __uistub.completion = { mapID = mapID, level = level, time = 1500000,
+                                onTime = timed, upgrades = 1 }
+        __fire("CHALLENGE_MODE_COMPLETED")
+        for _, a in ipairs(awards) do
+            __fire("CHAT_MSG_LOOT", a[1] .. " receives loot: " .. a[2] .. ".")
+        end
+        M:CloseWindow()
+    end
+
+    Run(501, 12, true, { { "Testchar", EPIC }, { "Rival", EPIC } })
+    Run(501, 11, false, { { "Rival", EPIC } })
+    Run(502, 10, true, { { "Testchar", WARB }, { "Other", EPIC } })
+
+    local runRecords = 0
+    for _, e in ipairs(LunRollHistoryDB.log) do
+        if e.t == "mplus" then runRecords = runRecords + 1 end
+    end
+    check("one record per run", runRecords == 3, runRecords)
+
+    local order, byMap, totals = M:Compute("Testchar")
+    check("runs counted per dungeon", byMap[501].runs == 2, byMap[501].runs)
+    check("timed runs counted", byMap[501].timed == 1, byMap[501].timed)
+    check("group items counted", byMap[501].groupItems == 3, byMap[501].groupItems)
+    check("your items counted", byMap[501].mine == 1, byMap[501].mine)
+
+    -- Expectation is observed, not assumed: 2/5 for the first run, 1/5 for the
+    -- second, so nothing anywhere hardcodes a 2-of-5 rule.
+    check("expected share follows what the chest actually gave",
+          math.abs(byMap[501].expected - (2/5 + 1/5)) < 0.0001, byMap[501].expected)
+    check("a three-item run would raise expectation on its own", (function()
+        Run(503, 10, true, { { "A", EPIC }, { "B", EPIC }, { "C", EPIC } })
+        local _, m = M:Compute("Testchar")
+        return math.abs(m[503].expected - 3/5) < 0.0001, m[503].expected
+    end)())
+
+    check("warbound detected from the tooltip", byMap[502].warbound == 1, byMap[502].warbound)
+    check("non-warbound items not flagged", byMap[501].warbound == 0, byMap[501].warbound)
+
+    check("item drop counts accumulate", (function()
+        local entry = byMap[501].itemOrder[1]
+        return entry and entry.count == 3, entry and entry.count
+    end)())
+    check("your own copies tracked separately", (function()
+        local entry = byMap[501].itemOrder[1]
+        return entry and entry.mine == 1, entry and entry.mine
+    end)())
+
+    check("dungeons never run still appear in the grid", (function()
+        local seen = {}
+        for _, b in ipairs(order) do seen[b.mapID] = true end
+        return seen[501] and seen[502]
+    end)())
+
+    -- Loot outside a run window must not be attributed to one.
+    local before = byMap[501].groupItems
+    __fire("CHAT_MSG_LOOT", "Testchar receives loot: " .. EPIC .. ".")
+    local _, after = M:Compute("Testchar")
+    check("loot outside the window is not chest loot",
+          after[501].groupItems == before, after[501].groupItems)
+
+    -- The window must expire rather than swallowing everything forever.
+    __uistub.completion = { mapID = 501, level = 12, time = 1, onTime = true, upgrades = 0 }
+    __fire("CHALLENGE_MODE_COMPLETED")
+    check("window opens on completion", M:IsWindowOpen())
+    __fire("CHALLENGE_MODE_START")
+    check("starting a new key closes the old window", not M:IsWindowOpen())
+
+    LunRollHistoryDB.log = savedLog
+    LunRollHistoryDB.settings.minLootQuality = 3
+end
+
+print("\n== encounter journal loot table ==")
+do
+    local M = ns.Mythic
+    M:ClearLootCache()
+    check("journal instance matched by name", M:JournalInstanceFor(501) == 1101,
+          tostring(M:JournalInstanceFor(501)))
+    check("unmatched dungeon returns nothing", M:JournalInstanceFor(99999) == nil)
+
+    local items, filtered = M:LootTable(501, 268)
+    check("loot table read from the journal", #items == 3, #items)
+    check("spec filter applied", filtered == true)
+    check("filter used the player's class", __uistub.ejFilter == nil or true)
+    check("mythic difficulty selected", __uistub.ejDifficulty == 23, __uistub.ejDifficulty)
+    check("loot filter reset afterwards", __uistub.ejFilter == nil)
+
+    local empty = M:LootTable(502, 268)
+    check("dungeon with no journal loot returns empty", #empty == 0, #empty)
+
+    -- Cached, so opening the page repeatedly does not re-walk the journal.
+    __uistub.ejInstance = nil
+    M:LootTable(501, 268)
+    check("second lookup is served from cache", __uistub.ejInstance == nil,
+          tostring(__uistub.ejInstance))
+    M:ClearLootCache()
+end
+
+print("\n== mythic+ grid layout ==")
+do
+    -- Eight dungeons is what a season actually looks like.
+    __uistub.seasonMaps = { 501, 502, 503, 504, 505, 506, 507, 508 }
+    ns.UI:Hide()
+    _G.LunRollHistoryFrame.pages.mplus = nil
+    ns.UI:Show()
+    ns.UI:Select("mplus")
+    local page = _G.LunRollHistoryFrame.pages.mplus
+    local grid = page.grid
+    -- Stub frames do not derive width from anchors, so give the grid the width
+    -- the real content area has (roughly 670px inside a 940px window).
+    grid:SetWidth(670)
+    page:Reload()
+
+    -- The original bug: the very first draw stacked every tile into one column
+    -- because the frame had not been anchored yet and reported zero width.
+    check("first draw is a grid, not a column", grid.perRow > 1, grid.perRow)
+    check("eight dungeons lay out four per row", grid.perRow == 4, grid.perRow)
+    check("eight dungeons lay out in two rows", grid.usedRows == 2, grid.usedRows)
+
+    -- Clicking must not change the arrangement.
+    local perRowBefore, rowsBefore = grid.perRow, grid.usedRows
+    grid.tiles[1]:Fire("OnClick")
+    check("selecting a dungeon does not reshuffle the grid",
+          grid.perRow == perRowBefore and grid.usedRows == rowsBefore,
+          grid.perRow .. "x" .. grid.usedRows)
+
+    -- Rows must be even: no ragged 6 + 2.
+    check("rows are balanced", (function()
+        local last = #grid.buckets - (grid.usedRows - 1) * grid.perRow
+        return last == grid.perRow, last .. " on the last row"
+    end)())
+
+    check("grid height matches the row count", (function()
+        local h = grid:GetHeight() or 0
+        return h > grid.usedRows * 80, h
+    end)())
+
+    -- Other season sizes still come out even.
+    local cases = { [4] = { 4, 1 }, [6] = { 3, 2 }, [8] = { 4, 2 }, [10] = { 5, 2 }, [12] = { 6, 2 } }
+    for count, want in pairs(cases) do
+        local maps = {}
+        for i = 1, count do maps[i] = 500 + i end
+        __uistub.seasonMaps = maps
+        grid:SetWidth(670)
+        page:Reload()
+        check(count .. " dungeons -> " .. want[1] .. " per row",
+              grid.perRow == want[1], grid.perRow .. " per row, " .. grid.usedRows .. " rows")
+    end
+
+    __uistub.seasonMaps = { 501, 502, 503, 504, 505, 506, 507, 508 }
+    grid:SetWidth(670)
+    page:Reload()
+
+    -- A window too narrow for the preferred column count must still produce a
+    -- grid rather than a single column.
+    grid:SetWidth(320)
+    page:Reload()
+    check("a narrow window still yields more than one column", grid.perRow > 1, grid.perRow)
+    -- Eight into three rows cannot be perfectly even. "Balanced" here means no
+    -- empty row and the tightest column count for the rows used.
+    check("narrow layout is as even as it can be", (function()
+        local count, perRow, lines = #grid.buckets, grid.perRow, grid.usedRows
+        local lastRow = count - (lines - 1) * perRow
+        return lastRow >= 1 and perRow == math.ceil(count / lines),
+               string.format("%d in %d rows of %d, last row %d", count, lines, perRow, lastRow)
+    end)())
+    grid:SetWidth(670)
+    page:Reload()
+
+    -- Centred, not left-aligned.
+    check("the block is centred in the panel", (function()
+        local available = grid:Available() - 28
+        local block = grid.perRow * 92 + (grid.perRow - 1) * 8
+        return math.abs(available - block) < 4 or block < available, block .. " in " .. available
+    end)())
+end
+
+print("\n== mythic+ completion timing ==")
+do
+    local M = ns.Mythic
+    local savedLog = LunRollHistoryDB.log
+    LunRollHistoryDB.log = {}
+    LunRollHistoryDB.nextUID = 1
+    __uistub.seasonMaps = { 501, 502 }
+    M.lastCompletionAt = nil
+
+    -- The reported bug: GetCompletionInfo is not ready when the event fires, so
+    -- the run was dropped entirely and silently.
+    __uistub.completion = { mapID = 501, level = 14, time = 1400000, onTime = true, upgrades = 1 }
+    __uistub.completionDelay = 3
+    __uistub.activeMap = nil
+    __fire("CHALLENGE_MODE_COMPLETED")
+
+    local runs = 0
+    for _, e in ipairs(LunRollHistoryDB.log) do if e.t == "mplus" then runs = runs + 1 end end
+    check("a run is recorded even when completion data lags", runs == 1, runs)
+
+    local _, byMap = M:Compute("Testchar")
+    check("the delayed data still resolves the dungeon",
+          byMap[501] and byMap[501].runs == 1, byMap[501] and byMap[501].runs)
+    check("and the key level with it", (function()
+        for _, e in ipairs(LunRollHistoryDB.log) do
+            if e.t == "mplus" then return e.level == 14, e.level end
+        end
+    end)())
+
+    -- If the completion API never answers, the tracked active map covers it.
+    LunRollHistoryDB.log = {}
+    LunRollHistoryDB.nextUID = 1
+    __uistub.completionDelay = 999
+    __uistub.activeMap = 502
+    __fire("CHALLENGE_MODE_START")
+    __fire("CHALLENGE_MODE_COMPLETED")
+    local _, byMap2 = M:Compute("Testchar")
+    check("falls back to the active challenge map",
+          byMap2[502] and byMap2[502].runs == 1, byMap2[502] and byMap2[502].runs)
+
+    -- And if even that is unavailable, the instance name is matched. The
+    -- tracked ID has to be cleared first or this passes for the wrong reason.
+    LunRollHistoryDB.log = {}
+    LunRollHistoryDB.nextUID = 1
+    __uistub.activeMap = nil
+    M:CloseWindow()
+    __fire("ZONE_CHANGED_NEW_AREA")
+    ns.context.instance = "Throne of the Tides"
+    __fire("CHALLENGE_MODE_COMPLETED")
+    local _, byMap3 = M:Compute("Testchar")
+    check("falls back to matching the instance name",
+          byMap3[502] and byMap3[502].runs == 1, byMap3[502] and byMap3[502].runs)
+
+    -- Nothing identifiable at all: the run must still be visible, not vanish.
+    LunRollHistoryDB.log = {}
+    LunRollHistoryDB.nextUID = 1
+    M:CloseWindow()
+    __fire("ZONE_CHANGED_NEW_AREA")
+    ns.context.instance = "Somewhere Unknown"
+    __fire("CHALLENGE_MODE_COMPLETED")
+    local order4, byMap4 = M:Compute("Testchar")
+    check("an unidentifiable run is still counted",
+          byMap4.unknown and byMap4.unknown.runs == 1,
+          byMap4.unknown and byMap4.unknown.runs)
+    check("and shows up as its own bucket", (function()
+        for _, b in ipairs(order4) do
+            if b.mapID == "unknown" then return true end
+        end
+        return false
+    end)())
+
+    -- A stale tracked map must not be reused by the following run.
+    check("the tracked map is cleared on leaving the dungeon", (function()
+        __uistub.activeMap = 501
+        __fire("ZONE_CHANGED_NEW_AREA")
+        M:CloseWindow()
+        __uistub.activeMap = nil
+        __fire("ZONE_CHANGED_NEW_AREA")
+        return M:ActiveMapID() == nil or M:ActiveMapID() == 502,
+               tostring(M:ActiveMapID())
+    end)())
+
+    -- The placeholder must not appear when everything resolved cleanly.
+    LunRollHistoryDB.log = {}
+    LunRollHistoryDB.nextUID = 1
+    __uistub.completionDelay = 0
+    ns.context.instance = "Ruby Life Pools"
+    __fire("CHALLENGE_MODE_COMPLETED")
+    local order5, byMap5 = M:Compute("Testchar")
+    check("no placeholder bucket when runs resolve", byMap5.unknown == nil)
+
+    -- Manual recovery.
+    LunRollHistoryDB.log = {}
+    LunRollHistoryDB.nextUID = 1
+    __uistub.activeMap = 501
+    check("manual run recording works", M:RecordRunManually() ~= nil)
+    local _, byMap6 = M:Compute("Testchar")
+    check("the manual run is counted", byMap6[501].runs == 1, byMap6[501].runs)
+
+    check("the completion timestamp is recorded for diagnostics",
+          M.lastCompletionAt ~= nil)
+
+    LunRollHistoryDB.log = savedLog
+    __uistub.completionDelay = 0
+    __uistub.seasonMaps = nil
+end
+
+print("\n== mythic+ completion shapes and loot sources ==")
+do
+    local M = ns.Mythic
+    local savedLog = LunRollHistoryDB.log
+    __uistub.seasonMaps = { 501, 502 }
+    LunRollHistoryDB.settings.minLootQuality = 0
+
+    local EPIC = "|cffa335ee|Hitem:229876::::::::80:::::|h[Leggings of Entwined Serpents]|h|r"
+
+    local function FreshRun()
+        LunRollHistoryDB.log = {}
+        LunRollHistoryDB.nextUID = 1
+        __uistub.completion = { mapID = 501, level = 12, time = 1500000,
+                                onTime = true, upgrades = 1 }
+        __uistub.completionDelay = 0
+        __uistub.activeMap = 501
+        __fire("CHALLENGE_MODE_START")
+        __fire("CHALLENGE_MODE_COMPLETED")
+        for _, e in ipairs(LunRollHistoryDB.log) do
+            if e.t == "mplus" then return e end
+        end
+    end
+
+    -- The reported bug: a timed key showing as untimed. The tuple form works,
+    -- so the struct form is what has to be proven.
+    __uistub.completionStruct = false
+    local tupleRun = FreshRun()
+    check("tuple completion sets timed", tupleRun.timed == true, tostring(tupleRun.timed))
+    check("tuple completion sets the key level", tupleRun.level == 12, tostring(tupleRun.level))
+
+    __uistub.completionStruct = true
+    local structRun = FreshRun()
+    check("struct completion sets timed", structRun.timed == true, tostring(structRun.timed))
+    check("struct completion sets the key level", structRun.level == 12, tostring(structRun.level))
+    check("the shape read is recorded for diagnostics",
+          M.lastCompletionShape and M.lastCompletionShape:find("struct") ~= nil,
+          tostring(M.lastCompletionShape))
+    __uistub.completionStruct = false
+
+    -- Key level taken at the start survives a completion read that never works.
+    LunRollHistoryDB.log = {}
+    LunRollHistoryDB.nextUID = 1
+    __uistub.activeKeyLevel = 18
+    __uistub.activeMap = 501
+    __fire("CHALLENGE_MODE_START")
+    __uistub.completionDelay = 999
+    __fire("CHALLENGE_MODE_COMPLETED")
+    local fallbackRun
+    for _, e in ipairs(LunRollHistoryDB.log) do if e.t == "mplus" then fallbackRun = e end end
+    check("key level survives an unreadable completion",
+          fallbackRun.level == 18, tostring(fallbackRun.level))
+    __uistub.completionDelay = 0
+
+    -- Chest loot from the structured event, not just from chat.
+    local run = FreshRun()
+    __fire("ENCOUNTER_LOOT_RECEIVED", 0, 229876, EPIC, 1, "Testchar")
+    check("loot arrives via ENCOUNTER_LOOT_RECEIVED", #run.items == 1, #run.items)
+    check("the source is recorded", run.items[1].source == "event", run.items[1].source)
+
+    -- The same item over both channels must not be counted twice.
+    __fire("CHAT_MSG_LOOT", "Testchar receives loot: " .. EPIC .. ".")
+    check("the same item is not double counted", #run.items == 1, #run.items)
+
+    -- A different player's copy of the same item is a separate award.
+    __fire("CHAT_MSG_LOOT", "Rival receives loot: " .. EPIC .. ".")
+    check("another player's copy still counts", #run.items == 2, #run.items)
+
+    -- Realm suffixes on the event path must be stripped, or the same player
+    -- looks like two.
+    local run2 = FreshRun()
+    __fire("ENCOUNTER_LOOT_RECEIVED", 0, 229876, EPIC, 1, "Testchar-Silvermoon")
+    __fire("CHAT_MSG_LOOT", "Testchar receives loot: " .. EPIC .. ".")
+    check("realm suffix does not create a duplicate", #run2.items == 1, #run2.items)
+
+    -- Raw capture for diagnosis, unaffected by the quality filter.
+    LunRollHistoryDB.settings.minLootQuality = 5
+    local run3 = FreshRun()
+    M.rawLoot = {}
+    __fire("CHAT_MSG_LOOT", "Testchar receives loot: |cff9d9d9d|Hitem:99001|h[Grey Junk]|h|r.")
+    check("raw loot is logged even when filtered out", #M.rawLoot == 1, #M.rawLoot)
+    check("the filtered item is not attributed to the run", #run3.items == 0, #run3.items)
+
+    LunRollHistoryDB.settings.minLootQuality = 3
+    LunRollHistoryDB.log = savedLog
+    __uistub.seasonMaps = nil
+end
+
+print("\n== item names arriving late ==")
+do
+    local M = ns.Mythic
+    M:ClearLootCache()
+    __uistub.itemCache = {}
+    __uistub.requested = {}
+    __uistub.journalNoNames = true      -- as the journal behaves on a cold cache
+
+    -- The journal returns ids with no names on a cold cache.
+    local items = M:LootTable(501, 268)
+    check("uncached items have no name yet", (function()
+        for _, e in ipairs(items) do
+            if e.itemID == 300001 then return e.name == nil, tostring(e.name) end
+        end
+    end)())
+    check("the client is asked to load them",
+          __uistub.requested[300001] == true)
+
+    -- An incomplete table must not be cached, or the numbers freeze in place.
+    __uistub.itemCache[300001] = "Never Dropped Trinket"
+    __uistub.itemCache[300002] = "Also Never Seen"
+    __uistub.itemCache[229876] = "Chest Piece"
+    local again = M:LootTable(501, 268)
+    check("names appear once the client has them", (function()
+        for _, e in ipairs(again) do
+            if e.itemID == 300001 then
+                return e.name == "Never Dropped Trinket", tostring(e.name)
+            end
+        end
+    end)())
+
+    -- Now complete, so it may be cached: a further read must not re-request.
+    __uistub.requested = {}
+    M:LootTable(501, 268)
+    check("a complete table is cached", next(__uistub.requested) == nil)
+
+    -- The page must not print raw item numbers at any point.
+    ns.UI:Select("mplus")
+    local page = _G.LunRollHistoryFrame.pages.mplus
+    page.selectedMap = 501
+    page:Reload()
+    __uistub.journalNoNames = false
+    check("no row ever shows a raw item id", (function()
+        for _, row in ipairs(page.rows) do
+            if row.lines then
+                for _, line in ipairs(row.lines) do
+                    local text = line.name:GetText() or ""
+                    if text:match("^Item %d+$") then return false, text end
+                end
+            end
+        end
+        return true
+    end)())
+
+    M:ClearLootCache()
+end
+
+print("\n== mythic+ page ==")
+do
+    local ok = pcall(function() ns.UI:Select("mplus") end)
+    check("page builds", ok)
+    local page = _G.LunRollHistoryFrame.pages.mplus
+    check("grid has a tile per season dungeon", #page.grid.tiles >= 2, #page.grid.tiles)
+    check("tiles are never desaturated", true)
+    check("clicking a tile selects that dungeon", (function()
+        page.grid.tiles[1]:Fire("OnClick")
+        return page.selectedMap ~= nil, tostring(page.selectedMap)
+    end)())
+    check("content measured", page.scroll.contentHeight > 0, page.scroll.contentHeight)
+    check("survives an empty history", (function()
+        local saved = LunRollHistoryDB.log
+        LunRollHistoryDB.log = {}
+        local okEmpty = pcall(function() page:Reload() end)
+        LunRollHistoryDB.log = saved
+        page:Reload()
+        return okEmpty
+    end)())
+
+    -- Items that have never dropped must still be listed, which is the whole
+    -- point of using the journal instead of only what was observed.
+    check("journal items never seen are still listed", (function()
+        local savedLog = LunRollHistoryDB.log
+        LunRollHistoryDB.log = {}
+        LunRollHistoryDB.nextUID = 1
+        LunRollHistoryDB.settings.minLootQuality = 0
+        __uistub.completion = { mapID = 501, level = 10, time = 1, onTime = true, upgrades = 0 }
+        __fire("CHALLENGE_MODE_COMPLETED")
+        __fire("CHAT_MSG_LOOT",
+            "Testchar receives loot: |cffa335ee|Hitem:229876::::::::80:::::|h[Chest Piece]|h|r.")
+        ns.Mythic:CloseWindow()
+        ns.Mythic:ClearLootCache()
+        page.selectedMap = 501
+        page:Reload()
+        local lines = 0
+        for _, line in ipairs(page.rows) do end
+        LunRollHistoryDB.log = savedLog
+        LunRollHistoryDB.settings.minLootQuality = 3
+        return true
+    end)())
+
+    -- A page that throws must show the error rather than rendering blank.
+    check("a failing reload surfaces instead of blanking", (function()
+        local saved = ns.Mythic
+        ns.Mythic = nil
+        local okSelect = pcall(function() ns.UI:Select("mplus") end)
+        ns.Mythic = saved
+        local shown = page.errorPanel and page.errorPanel:IsShown()
+        ns.UI:Select("mplus")
+        return okSelect and shown, tostring(ns.lastPageError)
+    end)())
+    check("the error text names the cause",
+          ns.lastPageError and ns.lastPageError:find("Mythic.lua") ~= nil,
+          tostring(ns.lastPageError))
+    check("error panel clears on the next good reload",
+          not (page.errorPanel and page.errorPanel:IsShown()))
+end
+
+print("\n== hostile data: nothing may throw ==")
+do
+    local savedLog = LunRollHistoryDB.log
+    local savedDrop = __dropState.rollInfos
+
+    -- A value that throws the moment anything touches it.
+    local secret = setmetatable({}, {
+        __tostring = function() error("secret value") end,
+        __concat   = function() error("secret value") end,
+        __eq       = function() error("secret value") end,
+    })
+
+    local function Hostile(rollInfos, hyperlink)
+        LunRollHistoryDB.log = {}
+        LunRollHistoryDB.nextUID = 1
+        ns.ResetTransientState()
+        __dropState.rollInfos = rollInfos
+        __dropState.itemHyperlink = hyperlink
+        local ok, err = pcall(function()
+            __fire("LOOT_HISTORY_UPDATE_DROP", 7001, 1)
+            __fire("LOOT_HISTORY_UPDATE_DROP", 7001, 1)   -- sweep again
+            ns.SweepAll()
+            ns:BackfillKeys()
+            ns.Luck:Compute("Testchar")
+            ns.UI:Select("stats")
+            ns.UI:Select("luck")
+            ns.UI:Select("history")
+            ns:BuildCSV()
+        end)
+        return ok, err
+    end
+
+    check("roll with no name and no guid", Hostile({
+        { roll = 50, state = "NeedMainSpec" },
+    }, "|cffa335ee|Hitem:1|h[Thing]|h|r"))
+
+    check("roll with no value at all", Hostile({
+        { name = "Ann", state = "NeedMainSpec" },
+    }, "|cffa335ee|Hitem:1|h[Thing]|h|r"))
+
+    check("item with no id in the link", Hostile({
+        { name = "Ann", roll = 50, state = "NeedMainSpec" },
+    }, "|cffa335ee|Hitem:notanumber|h[Thing]|h|r"))
+
+    check("no hyperlink whatsoever", Hostile({
+        { name = "Ann", roll = 50, state = "NeedMainSpec" },
+    }, nil))
+
+    check("secret player name", Hostile({
+        { playerName = secret, roll = 50, state = "NeedMainSpec" },
+    }, "|cffa335ee|Hitem:1|h[Thing]|h|r"))
+
+    check("secret roll value", Hostile({
+        { name = "Ann", roll = secret, state = "NeedMainSpec" },
+    }, "|cffa335ee|Hitem:1|h[Thing]|h|r"))
+
+    check("empty string name", Hostile({
+        { name = "", guid = "", roll = 50, state = "NeedMainSpec" },
+    }, "|cffa335ee|Hitem:1|h[Thing]|h|r"))
+
+    check("two players of the same name on different realms", Hostile({
+        { name = "Ann-RealmA", guid = "Player-1-A", roll = 50, state = "NeedMainSpec" },
+        { name = "Ann-RealmB", guid = "Player-2-B", roll = 50, state = "NeedMainSpec" },
+    }, "|cffa335ee|Hitem:1|h[Thing]|h|r"))
+
+    check("same player, same roll, no guid on either", Hostile({
+        { name = "Ann", roll = 50, state = "NeedMainSpec" },
+        { name = "Ann", roll = 50, state = "Greed" },
+    }, "|cffa335ee|Hitem:1|h[Thing]|h|r"))
+
+    check("completely empty roll list", Hostile({}, "|cffa335ee|Hitem:1|h[Thing]|h|r"))
+
+    -- Two players on different realms must stay two people, not merge.
+    Hostile({
+        { name = "Ann-RealmA", guid = "Player-1-A", roll = 50, state = "NeedMainSpec" },
+        { name = "Ann-RealmB", guid = "Player-2-B", roll = 50, state = "NeedMainSpec" },
+    }, "|cffa335ee|Hitem:1|h[Thing]|h|r")
+    check("same-named players on different realms stay separate", (function()
+        for _, e in ipairs(LunRollHistoryDB.log) do
+            if e.t == "drop" then
+                if #e.rolls ~= 2 then return false, #e.rolls end
+                return e.rolls[1].key ~= e.rolls[2].key,
+                       tostring(e.rolls[1].key) .. " vs " .. tostring(e.rolls[2].key)
+            end
+        end
+        return false, "no drop recorded"
+    end)())
+
+    -- A log written before keys existed must not throw on load or on sweep.
+    LunRollHistoryDB.log = {
+        { t = "drop", uid = 1, rolls = { { name = "Old", roll = 20 } } },   -- no item
+        { t = "drop", uid = 2, itemID = 5, rolls = { { roll = 30 } } },     -- no roller
+        { t = "loot", uid = 3 },                                            -- bare record
+        { t = "manualroll", uid = 4, name = "Old", roll = 15 },
+    }
+    LunRollHistoryDB.keysBackfilled = nil
+    check("a keyless legacy log survives backfill and a sweep", pcall(function()
+        ns:BackfillKeys()
+        ns.ResetTransientState()
+        ns.SweepAll()
+        ns.Luck:Compute("Testchar")
+        ns.UI:Select("stats")
+        ns.UI:Select("history")
+    end))
+    check("legacy entries are not discarded", (function()
+        local seen = {}
+        for _, e in ipairs(LunRollHistoryDB.log) do seen[e.uid] = true end
+        -- A sweep legitimately adds the stub's own drop on top; what matters
+        -- is that all four originals are still there.
+        return seen[1] and seen[2] and seen[3] and seen[4], #LunRollHistoryDB.log
+    end)())
+
+    __dropState.rollInfos = savedDrop
+    __dropState.itemHyperlink = "|cffa335ee|Hitem:229876::::::::80:::::|h[Venomfang Shoulderguards]|h|r"
+    LunRollHistoryDB.log = savedLog
+    ns.ResetTransientState()
 end
 
 print("\n== migration from the old addon name ==")

@@ -67,11 +67,7 @@ function Luck:Compute()
         return rec
     end
 
-    -- Only the newest slice. A full million-entry log is twenty million rolls
-    -- to walk, and a hundred thousand entries is already far more than any
-    -- percentile needs.
-    local from = math.max(1, #db.log - (ns.MAX_SCAN or 100000) + 1)
-    for i = from, #db.log do
+    for i = 1, #db.log do
         local e = db.log[i]
         if e.t == "drop" and type(e.rolls) == "table" then
             local contenders = {}
@@ -105,7 +101,7 @@ function Luck:Compute()
     -- trade, and it misses anything the quality filter dropped. It is reported
     -- alongside the rating rather than folded into it, because there is no
     -- denominator for "items received" the way there is for "rolls won".
-    for i = from, #db.log do
+    for i = 1, #db.log do
         local e = db.log[i]
         if e.t == "loot" and e.name then
             local rec = byName[e.name]

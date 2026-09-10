@@ -2,7 +2,7 @@
 ## Title: LunRollHistory
 ## Notes: Logs every group loot roll, manual /roll, and loot award to an account-wide database.
 ## Author: you
-## Version: 1.0.4
+## Version: 1.0.0
 ## SavedVariables: LunRollHistoryDB
 ## Category-enUS: Guild
 ## IconTexture: Interface\AddOns\LunRollHistory\media\Logo
@@ -14,7 +14,6 @@ Core.lua
 Theme.lua
 Widgets.lua
 Luck.lua
-Mythic.lua
 UI.lua
 Minimap.lua
 Capture.lua

@@ -18,3 +18,4 @@ UI.lua
 Minimap.lua
 Capture.lua
 Export.lua
+Mythic.lua

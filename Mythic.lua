@@ -13,8 +13,25 @@ local ADDON, ns = ...
 local M = {}
 ns.Mythic = M
 
-M.LOOT_WINDOW = 240        -- seconds after completion to attribute chest loot
+M.LOOT_WINDOW = 45         -- seconds after completion to attribute chest loot
 M.MIN_RUNS = 3             -- below this a per-dungeon rating means nothing
+
+--------------------------------------------------------------------------------
+-- Current character
+--------------------------------------------------------------------------------
+-- "You opened X chests" has to mean this character's chests. Runs are stamped
+-- with who ran them; anything recorded before this existed carries no stamp and
+-- is still shown, since hiding a player's existing history without explanation
+-- would be worse than pooling it.
+function M:CharacterKey()
+    local ok, name = pcall(UnitName, "player")
+    if not ok or type(name) ~= "string" or name == "" then return nil end
+    local okRealm, realm = pcall(GetRealmName)
+    if okRealm and type(realm) == "string" and realm ~= "" then
+        return name .. "-" .. realm
+    end
+    return name
+end
 
 --------------------------------------------------------------------------------
 -- Season dungeon list
@@ -168,17 +185,38 @@ end
 -- wording varies and can be missing entirely; the event is structured but does
 -- not fire everywhere. Taking both and de-duplicating is more reliable than
 -- betting on either.
-local function AlreadyRecorded(run, player, itemID)
-    if not itemID then return false end
+-- Matching on the item id where there is one, falling back to the name. An
+-- unparsable link used to mean no id, which meant no match, which meant the
+-- same item counted once from chat and once from the event.
+local function AlreadyRecorded(run, player, itemID, itemName)
     for _, item in ipairs(run.items or {}) do
-        if item.itemID == itemID and item.name == player then return true end
+        if item.name == player then
+            -- Ids match when both sides have one...
+            if itemID and item.itemID and item.itemID == itemID then return true end
+            -- ...and otherwise the name settles it. One source having an id and
+            -- the other not is the normal case, not an edge case: comparing
+            -- only ids let the same item through twice.
+            if itemName and item.item and item.item == itemName then return true end
+        end
     end
     return false
 end
 
+-- Lives in Core, where every file can reach it regardless of load order.
+local function IsGear(itemID)
+    return ns:IsGearItem(itemID)
+end
+
+function M:IsGearItem(itemID)
+    return IsGear(itemID)
+end
+
 function M:AddItem(player, itemID, itemName, link, source)
     if not self:IsWindowOpen() or not player then return false end
-    if AlreadyRecorded(activeRun, player, itemID) then return false end
+    -- A keystone chest hands out gear. Anything else picked up while the window
+    -- is open is someone looting in the dungeon, not the chest.
+    if not IsGear(itemID) then return false end
+    if AlreadyRecorded(activeRun, player, itemID, itemName) then return false end
 
     activeRun.items = activeRun.items or {}
     activeRun.items[#activeRun.items + 1] = {
@@ -338,6 +376,7 @@ local function OnCompleted()
         mapID = activeMapID or ReadActiveMap() or MapIDFromInstanceName(),
         level = activeLevel,
         party = PartySize(),
+        char = M:CharacterKey(),
         items = {},
     })
     windowClosesAt = GetServerTime() + M.LOOT_WINDOW
@@ -394,7 +433,8 @@ function M:RecordRunManually()
     activeRun = ns:Append({
         t = "mplus", mapID = mapID,
         mapName = (self:MapInfo(mapID) or {}).name,
-        party = PartySize(), items = {}, manual = true,
+        party = PartySize(), char = M:CharacterKey(),
+        items = {}, manual = true,
     })
     windowClosesAt = GetServerTime() + self.LOOT_WINDOW
     return activeRun
@@ -441,13 +481,17 @@ function M:Compute(playerName)
     -- them including the ones never run.
     for _, mapID in ipairs(self:SeasonMaps()) do Bucket(mapID) end
 
+    local me = self:CharacterKey()
     local from = math.max(1, #db.log - (ns.MAX_SCAN or 100000) + 1)
     for i = from, #db.log do
         local e = db.log[i]
+        -- This character's runs only. Records from before runs were stamped
+        -- carry no character and are still counted.
+        local mine = (e.char == nil) or (me == nil) or (e.char == me)
         -- A run whose dungeon never resolved is still a run. Bucketing it under
         -- a placeholder keeps it visible instead of silently vanishing, which
         -- is how the original problem hid itself.
-        if e.t == "mplus" then
+        if e.t == "mplus" and mine then
             local b = Bucket(e.mapID or "unknown")
             b.runs = b.runs + 1
             b.levelSum = b.levelSum + (e.level or 0)
@@ -570,13 +614,58 @@ local function EJCall(name, ...)
     return unpack(results, 2)
 end
 
+-- Reading the journal means driving it: selecting an instance, a difficulty
+-- and a loot filter. That state is global and shared with Blizzard's own
+-- Encounter Journal window.
+--
+-- Trying to save and put back exactly what the player had did not hold up:
+-- the getters are not all present, and there is no getter at all for the
+-- selected encounter. So instead of guessing, the journal is left in one
+-- known state after every read - current loot specialisation, all slots,
+-- Mythic difficulty - which is how these dungeons get looked at anyway.
+M.JOURNAL_DIFFICULTY = 23      -- Mythic
+
+local function AllSlots()
+    local enum = _G.Enum and _G.Enum.ItemSlotFilterType
+    if enum and enum.NoFilter then return enum.NoFilter end
+    return 0
+end
+
+local function NormaliseJournal()
+    EJCall("EJ_SetDifficulty", M.JOURNAL_DIFFICULTY)
+
+    local classID = select(3, UnitClass("player"))
+    local _, specID = M:CurrentSpecName()
+    if classID and specID then
+        EJCall("EJ_SetLootFilter", classID, specID)
+    end
+
+    -- All slots: a slot filter left over from a previous read would hide most
+    -- of the table without any indication why.
+    if C_EncounterJournal and C_EncounterJournal.SetSlotFilter then
+        pcall(C_EncounterJournal.SetSlotFilter, AllSlots())
+    else
+        EJCall("EJ_SetSlotFilter", AllSlots())
+    end
+end
+M.NormaliseJournal = NormaliseJournal
+
+-- The instance is the one thing worth putting back: it is what the player is
+-- reading, and unlike the filters it is not something they would want reset.
+local function SelectedInstance()
+    return EJCall("EJ_GetCurrentInstance")
+end
+
 local function BuildJournalIndex()
     if journalByName then return journalByName end
     journalByName = {}
 
     local numTiers = EJCall("EJ_GetNumTiers")
-    if type(numTiers) ~= "number" then return journalByName end
-    local restoreTier = EJCall("EJ_GetCurrentTier")
+    if type(numTiers) ~= "number" then
+        journalByName = nil
+        return {}
+    end
+    local savedTier, savedInstance = EJCall("EJ_GetCurrentTier"), SelectedInstance()
 
     for tier = 1, numTiers do
         if EJCall("EJ_SelectTier", tier) ~= nil or true then
@@ -594,7 +683,9 @@ local function BuildJournalIndex()
         end
     end
 
-    if restoreTier then EJCall("EJ_SelectTier", restoreTier) end
+    if savedTier then EJCall("EJ_SelectTier", savedTier) end
+    if savedInstance then EJCall("EJ_SelectInstance", savedInstance) end
+    NormaliseJournal()
     return journalByName
 end
 
@@ -671,6 +762,7 @@ function M:LootTable(mapID, specID)
         return {}, false
     end
 
+    local savedInstance = SelectedInstance()
     EJCall("EJ_SelectInstance", instanceID)
     -- Mythic difficulty, so the table matches what a keystone actually drops.
     EJCall("EJ_SetDifficulty", 23)
@@ -692,7 +784,8 @@ function M:LootTable(mapID, specID)
         end
     end
 
-    if specID then EJCall("EJ_ResetLootFilter") end
+    if savedInstance then EJCall("EJ_SelectInstance", savedInstance) end
+    NormaliseJournal()
 
     table.sort(items, function(a, b) return (a.name or "") < (b.name or "") end)
 
@@ -708,17 +801,36 @@ function M:LootTable(mapID, specID)
     return items, filtered and #items > 0
 end
 
+-- Only the loot tables. The instance index is expensive to build - it walks
+-- every tier, selecting as it goes - and nothing about a spec change
+-- invalidates it.
 function M:ClearLootCache()
     lootCache = {}
+end
+
+function M:ClearJournalIndex()
     journalByName = nil
+    lootCache = {}
 end
 
 -- Item details arriving late are the normal case, not an edge case: the whole
 -- loot table is usually uncached the first time a dungeon is opened.
 local refreshQueued = false
 
+-- The loot table is filtered to the current loot spec, so it has to be rebuilt
+-- when that changes rather than showing the previous spec's items.
+local function OnSpecChanged()
+    M:ClearLootCache()
+    if ns.UI and ns.UI:IsShown() then ns.UI:Refresh() end
+end
+
+ns:On("PLAYER_LOOT_SPEC_UPDATED", OnSpecChanged)
+ns:On("PLAYER_SPECIALIZATION_CHANGED", OnSpecChanged)
+ns:On("ACTIVE_TALENT_GROUP_CHANGED", OnSpecChanged)
+
 ns:On("ITEM_DATA_LOAD_RESULT", function(itemID)
-    if itemID then pendingNames[itemID] = nil end
+    if not itemID or not pendingNames[itemID] then return end   -- not ours
+    pendingNames[itemID] = nil
     if refreshQueued or not ns.UI or not ns.UI:IsShown() then return end
     refreshQueued = true
     local function Refresh()

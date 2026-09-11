@@ -4,7 +4,7 @@
 local ADDON, ns = ...
 
 ns.ADDON        = ADDON
-ns.VERSION      = "1.2.1"
+ns.VERSION      = "1.1.0"
 ns.DB_VERSION   = 1
 ns.MAX_ENTRIES  = 20000     -- oldest entries are pruned past this
 ns.MAX_CAP      = 1000000   -- highest the History size setting allows
@@ -137,6 +137,7 @@ local function ApplyDefaults()
     if s.captureLootAwards  == nil then s.captureLootAwards  = true  end
     if s.captureRollStarts  == nil then s.captureRollStarts  = true  end
     if s.groupOnly          == nil then s.groupOnly          = false end
+    if s.sweepOnOpen        == nil then s.sweepOnOpen        = true  end
     if s.maxEntries         == nil then s.maxEntries         = ns.MAX_ENTRIES end
     s.maxEntries = math.max(1000, math.min(ns.MAX_CAP, s.maxEntries))
     if s.accent             == nil then s.accent             = "orchid" end
@@ -148,6 +149,7 @@ local function ApplyDefaults()
     if s.lootGearOnly       == nil then s.lootGearOnly       = false end
     if s.ignoreItems        == nil then s.ignoreItems        = {} end
     if s.minimapHide        == nil then s.minimapHide        = false end
+    if s.mplusShowNonGear   == nil then s.mplusShowNonGear   = false end
     if s.minimapAngle       == nil then s.minimapAngle       = 198 end
     ns.MAX_ENTRIES = s.maxEntries
 
@@ -255,6 +257,117 @@ function ns:ParseItemLink(link)
 end
 
 --------------------------------------------------------------------------------
+-- Item classification
+--------------------------------------------------------------------------------
+-- Weapons and armour. Trinkets are armour, so they count; recipes, patterns,
+-- reagents and the rest do not. An item the client has not cached is treated
+-- as gear, erring toward showing something rather than hiding a real drop.
+local CLASS_WEAPON, CLASS_ARMOR = 2, 4
+
+function ns:IsGearItem(itemID)
+    local fn = (C_Item and C_Item.GetItemInfoInstant) or _G.GetItemInfoInstant
+    if not fn or not itemID then return true end
+    local ok, _, _, _, _, _, classID = pcall(fn, itemID)
+    if not ok or type(classID) ~= "number" then return true end
+    return classID == CLASS_WEAPON or classID == CLASS_ARMOR
+end
+
+--------------------------------------------------------------------------------
+-- Module integrity
+--------------------------------------------------------------------------------
+-- Updating file by file leaves a mix of versions, and the first symptom is an
+-- "attempt to call a nil value" pointing at a line that looks fine. Checking
+-- up front turns that into a message naming the file that is out of date.
+local REQUIRED = {
+    { file = "Theme.lua",   get = function() return ns.Theme and ns.Theme.SetAccent end },
+    { file = "Widgets.lua", get = function() return ns.Widgets and ns.Widgets.ColumnHeader end },
+    { file = "Luck.lua",    get = function() return ns.Luck and ns.Luck.Compute end },
+    { file = "Mythic.lua",  get = function() return ns.Mythic and ns.Mythic.IsGearItem end },
+    { file = "UI.lua",      get = function() return ns.UI and ns.UI.Toggle end },
+    { file = "Capture.lua", get = function() return ns.SweepAll end },
+    { file = "Export.lua",  get = function() return ns.BuildCSV end },
+}
+
+function ns:CheckModules()
+    local stale = {}
+    for _, entry in ipairs(REQUIRED) do
+        local ok, value = pcall(entry.get)
+        if not ok or not value then stale[#stale + 1] = entry.file end
+    end
+    ns.staleModules = (#stale > 0) and stale or nil
+    return stale
+end
+
+--------------------------------------------------------------------------------
+-- Deterministic keys
+--------------------------------------------------------------------------------
+-- Two clients watching the same roll must derive the same key from it, or
+-- merging their logs is impossible. That rules out anything the client
+-- assigns: the loot-history encounter and list IDs are session-scoped
+-- counters, numbered independently per client and restarted on reload, so
+-- they identify nothing outside the session that produced them.
+--
+-- What every witness agrees on is the content: the encounter, the item, who
+-- rolled, and what they rolled. Keys are built from that.
+--
+-- Residual collision: the same player rolling the same number on the same item
+-- twice within one encounter produces one key, and the two roles merge into
+-- one. That needs a duplicate drop of the same item in a single kill plus a
+-- repeated roll value, and the cost when it happens is one undercounted roll.
+local function KeyPart(v)
+    if v == nil then return "?" end
+    return (tostring(v):gsub("[:|%s]", "_"))
+end
+
+function ns:DropKey(rec)
+    if type(rec) ~= "table" then return nil end
+    local item = rec.itemID or rec.item
+    if not item then return nil end
+    return table.concat({
+        "d",
+        KeyPart(rec.diffID or 0),
+        KeyPart(rec.encName or rec.inst or "?"),
+        KeyPart(item),
+    }, ":")
+end
+
+function ns:RollKey(dropKey, roll)
+    if not dropKey or type(roll) ~= "table" or roll.roll == nil then return nil end
+    -- GUID where we have it. The name fallback is fine inside a guild but will
+    -- not merge cleanly across realms, which is worth knowing rather than
+    -- pretending otherwise.
+    local who = roll.guid
+    if not who or who == "" then
+        who = (roll.name or "?") .. "-" .. (roll.realm or "")
+    end
+    return dropKey .. ":" .. KeyPart(who) .. ":" .. KeyPart(roll.roll)
+end
+
+-- Existing logs get keys computed from what they already store, so nothing
+-- needs re-recording and no history is lost.
+function ns:BackfillKeys()
+    local db = LunRollHistoryDB
+    if not db or db.keysBackfilled then return 0 end
+    local filled = 0
+    for i = 1, #db.log do
+        local e = db.log[i]
+        if e.t == "drop" then
+            e.key = e.key or ns:DropKey(e)
+            if e.key and type(e.rolls) == "table" then
+                for _, r in ipairs(e.rolls) do
+                    if not r.key then
+                        r.key = ns:RollKey(e.key, r)
+                        if r.key then filled = filled + 1 end
+                    end
+                end
+            end
+        end
+    end
+    db.keysBackfilled = true
+    return filled
+end
+
+--------------------------------------------------------------------------------
 -- Boot
 --------------------------------------------------------------------------------
 ns:On("ADDON_LOADED", function(name)
@@ -263,6 +376,16 @@ ns:On("ADDON_LOADED", function(name)
     ns.loaded = true
     ns.Theme:Init()
     ns.Theme:LoadFromSettings(LunRollHistoryDB.settings)
+    local stale = ns:CheckModules()
+    if #stale > 0 then
+        ns:Print("|cffff6666Some files are out of date:|r " .. table.concat(stale, ", ")
+            .. ". Replace the whole addon folder rather than individual files.")
+    end
+
+    local filled = ns:BackfillKeys()
+    if filled > 0 then
+        ns:Debug("backfilled", filled, "roll keys")
+    end
     if ns.OnDBReady then ns.OnDBReady() end
     if ns.migrated then
         ns:Print(("Imported %d entries from the previous RollLedger database."):format(ns.migrated))
@@ -272,7 +395,9 @@ end)
 ns:On("PLAYER_ENTERING_WORLD", function()
     ApplyDefaults()
     RefreshInstanceContext()
-    if ns.ResetTransientState then ns.ResetTransientState() end
+    -- Not a full reset: the client's loot-history IDs remain valid across a
+    -- zone change, and forgetting them makes the next sweep re-add every drop.
+    if ns.InvalidateIndexes then ns.InvalidateIndexes() end
 end)
 
 ns:On("ZONE_CHANGED_NEW_AREA", RefreshInstanceContext)

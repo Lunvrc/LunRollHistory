@@ -1703,7 +1703,10 @@ do
     local items, filtered = M:LootTable(501, 268)
     check("loot table read from the journal", #items == 3, #items)
     check("spec filter applied", filtered == true)
-    check("filter used the player's class", __uistub.ejFilter == nil or true)
+    check("the filter is applied with the player's class and spec",
+          __uistub.ejLastFilter and __uistub.ejLastFilter[1] == 10
+          and __uistub.ejLastFilter[2] == 268,
+          __uistub.ejLastFilter and table.concat(__uistub.ejLastFilter, "/"))
     check("mythic difficulty selected", __uistub.ejDifficulty == 23, __uistub.ejDifficulty)
     check("loot filter reset afterwards", __uistub.ejFilter == nil)
 
@@ -2048,6 +2051,233 @@ do
     M:ClearLootCache()
 end
 
+print("\n== chests opened, items received ==")
+do
+    local M = ns.Mythic
+    local savedLog, savedUID = LunRollHistoryDB.log, LunRollHistoryDB.nextUID
+    LunRollHistoryDB.settings.minLootQuality = 0
+    __uistub.seasonMaps = { 501, 502 }
+
+    local GEAR    = "|cffa335ee|Hitem:229876::::::::80:::::|h[Chest Piece]|h|r"
+    local GEAR2   = "|cffa335ee|Hitem:300001::::::::80:::::|h[Other Gear]|h|r"
+    local REAGENT = "|cff1eff00|Hitem:12345::::::::80:::::|h[Void-tempered Scales]|h|r"
+
+    local function Run(awards)
+        __uistub.completion = { mapID = 501, level = 10, time = 1, onTime = true, upgrades = 0 }
+        __uistub.completionDelay = 0
+        __uistub.activeMap = 501
+        LunRollHistoryDB.log = LunRollHistoryDB.log
+        __fire("CHALLENGE_MODE_START")
+        __fire("CHALLENGE_MODE_COMPLETED")
+        for _, a in ipairs(awards) do
+            __fire("CHAT_MSG_LOOT", a[1] .. " receives loot: " .. a[2] .. ".")
+        end
+        M:CloseWindow()
+    end
+
+    LunRollHistoryDB.log = {}
+    LunRollHistoryDB.nextUID = 1
+
+    -- Two chests, one item to us.
+    Run({ { "Testchar", GEAR }, { "Rival", GEAR } })
+    Run({ { "Rival", GEAR }, { "Other", GEAR } })
+
+    local _, byMap = M:Compute("Testchar")
+    check("chests opened counts runs", byMap[501].runs == 2, byMap[501].runs)
+    check("items received counts only ours", byMap[501].mine == 1, byMap[501].mine)
+
+    -- Reagents looted in the dungeon are not chest loot.
+    LunRollHistoryDB.log = {}
+    LunRollHistoryDB.nextUID = 1
+    Run({ { "Testchar", GEAR }, { "Testchar", REAGENT } })
+    local _, byMap2 = M:Compute("Testchar")
+    check("a reagent looted in the window is not chest loot",
+          byMap2[501].mine == 1, byMap2[501].mine)
+    check("nor does it count toward the group total",
+          byMap2[501].groupItems == 1, byMap2[501].groupItems)
+
+    -- The same item over both channels is one item, even without an id.
+    LunRollHistoryDB.log = {}
+    LunRollHistoryDB.nextUID = 1
+    __uistub.activeMap = 501
+    __fire("CHALLENGE_MODE_START")
+    __fire("CHALLENGE_MODE_COMPLETED")
+    __fire("ENCOUNTER_LOOT_RECEIVED", 0, nil, "|cffa335ee|Hitem:|h[Chest Piece]|h|r", 1, "Testchar")
+    __fire("CHAT_MSG_LOOT", "Testchar receives loot: " .. GEAR .. ".")
+    M:CloseWindow()
+    local _, byMap3 = M:Compute("Testchar")
+    check("an item with no parsable id is not counted twice",
+          byMap3[501].mine == 1, byMap3[501].mine)
+
+    -- Character scoping.
+    LunRollHistoryDB.log = {}
+    LunRollHistoryDB.nextUID = 1
+    Run({ { "Testchar", GEAR } })
+    for _, e in ipairs(LunRollHistoryDB.log) do
+        if e.t == "mplus" then e.char = "SomebodyElse-Realm" end
+    end
+    Run({ { "Testchar", GEAR2 } })
+    local _, byMap4 = M:Compute("Testchar")
+    check("another character's runs are not counted",
+          byMap4[501].runs == 1, byMap4[501].runs)
+    check("nor their chest items", byMap4[501].mine == 1, byMap4[501].mine)
+
+    check("runs are stamped with the character who ran them", (function()
+        for _, e in ipairs(LunRollHistoryDB.log) do
+            if e.t == "mplus" and e.char ~= "SomebodyElse-Realm" then
+                return e.char ~= nil, tostring(e.char)
+            end
+        end
+    end)())
+
+    -- Runs recorded before stamping existed must not disappear.
+    LunRollHistoryDB.log = {}
+    LunRollHistoryDB.nextUID = 1
+    ns:Append({ t = "mplus", mapID = 501, party = 5, items = {} })   -- no char
+    local _, byMap5 = M:Compute("Testchar")
+    check("older unstamped runs are still counted",
+          byMap5[501].runs == 1, byMap5[501].runs)
+
+    LunRollHistoryDB.log = savedLog
+    LunRollHistoryDB.nextUID = savedUID
+    LunRollHistoryDB.settings.minLootQuality = 3
+    __uistub.seasonMaps = nil
+end
+
+print("\n== loot spec changes ==")
+do
+    local M = ns.Mythic
+    __uistub.seasonMaps = { 501, 502 }
+    __uistub.itemCache = { [229876] = "Chest Piece", [300001] = "Never Dropped Trinket",
+                           [300002] = "Also Never Seen" }
+    M:ClearLootCache()
+
+    ns.UI:Show("mplus")          -- the refresh only fires for a visible window
+    local page = _G.LunRollHistoryFrame.pages.mplus
+    page.selectedMap = 501
+    page:Reload()
+
+    -- Changing loot spec must rebuild the table, not leave the previous spec's
+    -- items on screen.
+    local before = __uistub.ejFilterCount or 0
+    __fire("PLAYER_LOOT_SPEC_UPDATED")
+    check("changing loot spec rebuilds the loot table",
+          (__uistub.ejFilterCount or 0) > before,
+          string.format("%d applications before, %d after",
+                        before, __uistub.ejFilterCount or 0))
+
+    check("the specialisation change also survives a talent swap", pcall(function()
+        __fire("ACTIVE_TALENT_GROUP_CHANGED")
+        __fire("PLAYER_SPECIALIZATION_CHANGED")
+    end))
+
+    -- A dungeon never run still shows what can drop there.
+    check("an unrun dungeon still shows its loot table", (function()
+        page.selectedMap = 501
+        local savedLog = LunRollHistoryDB.log
+        LunRollHistoryDB.log = {}
+        ns.Mythic:ClearLootCache()
+        page:Reload()
+        local shown = 0
+        for _, row in ipairs(page.rows) do
+            if row.shown then shown = row.shown end
+        end
+        LunRollHistoryDB.log = savedLog
+        return shown > 0, shown .. " rows"
+    end)())
+
+    check("the table is filtered to the current spec", (function()
+        local _, filtered = M:LootTable(501, 268)
+        return filtered == true
+    end)())
+
+    __uistub.seasonMaps = nil
+    M:ClearLootCache()
+end
+
+print("\n== loot table is journal only ==")
+do
+    local M = ns.Mythic
+    local savedLog, savedUID = LunRollHistoryDB.log, LunRollHistoryDB.nextUID
+    __uistub.seasonMaps = { 501, 502 }
+    __uistub.itemCache = { [229876] = "Chest Piece", [300001] = "Never Dropped Trinket",
+                           [300002] = "Also Never Seen", [777001] = "Off Spec Plate" }
+    LunRollHistoryDB.settings.minLootQuality = 0
+    M:ClearLootCache()
+
+    -- Record a drop of something the journal does not list for this spec:
+    -- somebody else's loot, which must not appear in our table.
+    LunRollHistoryDB.log = {}
+    LunRollHistoryDB.nextUID = 1
+    __uistub.completion = { mapID = 501, level = 10, time = 1, onTime = true, upgrades = 0 }
+    __uistub.completionDelay = 0
+    __uistub.activeMap = 501
+    __fire("CHALLENGE_MODE_START")
+    __fire("CHALLENGE_MODE_COMPLETED")
+    __fire("CHAT_MSG_LOOT",
+        "Rival receives loot: |cffa335ee|Hitem:777001::::::::80:::::|h[Off Spec Plate]|h|r.")
+    __fire("CHAT_MSG_LOOT",
+        "Testchar receives loot: |cffa335ee|Hitem:229876::::::::80:::::|h[Chest Piece]|h|r.")
+    M:CloseWindow()
+
+    ns.UI:Show("mplus")
+    local page = _G.LunRollHistoryFrame.pages.mplus
+    page.selectedMap = 501
+    page:Reload()
+
+    local names = {}
+    for _, row in ipairs(page.rows) do
+        if row.lines then
+            for i = 1, (row.shown or 0) do
+                names[#names + 1] = row.lines[i].name:GetText() or ""
+            end
+        end
+    end
+
+    check("the journal's items are listed", (function()
+        for _, n in ipairs(names) do
+            if n == "Never Dropped Trinket" then return true end
+        end
+        return false, table.concat(names, ", ")
+    end)())
+    check("an item the journal does not list is not shown", (function()
+        for _, n in ipairs(names) do
+            if n == "Off Spec Plate" then return false, "off-spec item listed" end
+        end
+        return true
+    end)())
+    check("nothing is labelled as not in journal", (function()
+        for _, row in ipairs(page.rows) do
+            if row.lines then
+                for i = 1, (row.shown or 0) do
+                    local detail = row.lines[i].mine:GetText() or ""
+                    if detail:find("not in journal", 1, true) then return false, detail end
+                end
+            end
+        end
+        return true
+    end)())
+    check("counts still show against journal items", (function()
+        for _, row in ipairs(page.rows) do
+            if row.lines then
+                for i = 1, (row.shown or 0) do
+                    if (row.lines[i].name:GetText() or "") == "Chest Piece" then
+                        return (row.lines[i].count:GetText() or "") ~= "-",
+                               row.lines[i].count:GetText()
+                    end
+                end
+            end
+        end
+        return false, "Chest Piece missing"
+    end)())
+
+    LunRollHistoryDB.log = savedLog
+    LunRollHistoryDB.nextUID = savedUID
+    LunRollHistoryDB.settings.minLootQuality = 3
+    __uistub.seasonMaps = nil
+    M:ClearLootCache()
+end
+
 print("\n== mythic+ page ==")
 do
     local ok = pcall(function() ns.UI:Select("mplus") end)
@@ -2056,9 +2286,51 @@ do
     check("grid has a tile per season dungeon", #page.grid.tiles >= 2, #page.grid.tiles)
     check("tiles are never desaturated", true)
     check("clicking a tile selects that dungeon", (function()
-        page.grid.tiles[1]:Fire("OnClick")
+        page.selectedMap = nil
+        page:Reload()
+        page.grid.tiles[1]:Fire("OnClick", "LeftButton")
         return page.selectedMap ~= nil, tostring(page.selectedMap)
     end)())
+
+    -- Clicking the selected dungeon again returns to the combined view.
+    check("clicking the same tile again clears the selection", (function()
+        local first = page.grid.tiles[1]
+        page.selectedMap = nil
+        page:Reload()
+        first:Fire("OnClick", "LeftButton")
+        local selected = page.selectedMap
+        first:Fire("OnClick", "LeftButton")
+        return selected ~= nil and page.selectedMap == nil,
+               tostring(selected) .. " -> " .. tostring(page.selectedMap)
+    end)())
+
+    check("right clicking any tile clears the selection", (function()
+        page.grid.tiles[1]:Fire("OnClick", "LeftButton")
+        page.grid.tiles[2]:Fire("OnClick", "RightButton")
+        return page.selectedMap == nil, tostring(page.selectedMap)
+    end)())
+
+    check("clicking a different tile switches rather than clearing", (function()
+        page.selectedMap = nil
+        page:Reload()
+        page.grid.tiles[1]:Fire("OnClick", "LeftButton")
+        local first = page.selectedMap
+        page.grid.tiles[2]:Fire("OnClick", "LeftButton")
+        return page.selectedMap ~= nil and page.selectedMap ~= first,
+               tostring(first) .. " -> " .. tostring(page.selectedMap)
+    end)())
+
+    check("the hint says how to get back", (function()
+        page.grid.tiles[1]:Fire("OnClick", "LeftButton")
+        local withSelection = page.grid.hint:GetText() or ""
+        page.grid.tiles[1]:Fire("OnClick", "LeftButton")
+        local without = page.grid.hint:GetText() or ""
+        return withSelection:find("again", 1, true) ~= nil
+           and without:find("dungeons this season", 1, true) ~= nil,
+               withSelection .. " | " .. without
+    end)())
+    page.selectedMap = nil
+    page:Reload()
     check("content measured", page.scroll.contentHeight > 0, page.scroll.contentHeight)
     check("survives an empty history", (function()
         local saved = LunRollHistoryDB.log

@@ -819,8 +819,15 @@ local function CreateMythicPage(parent)
             end
         end)
         tile:SetScript("OnLeave", function(self) self:Paint() end)
-        tile:SetScript("OnClick", function(self)
-            page.selectedMap = self.mapID
+        tile:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+        tile:SetScript("OnClick", function(self, button)
+            -- Clicking the selected dungeon again, or right-clicking any of
+            -- them, clears the selection and returns to the combined view.
+            if button == "RightButton" or page.selectedMap == self.mapID then
+                page.selectedMap = nil
+            else
+                page.selectedMap = self.mapID
+            end
             page:Reload()
         end)
 
@@ -992,8 +999,25 @@ local function CreateMythicPage(parent)
     local itemsRow = W.Panel(body, { color = C.row })
     itemsRow.title = W.Text(itemsRow, "Items seen drop", 12.5, C.text)
     itemsRow.title:SetPoint("TOPLEFT", 14, -12)
+    -- Recipes, patterns and reagents appear in the journal's list. Most people
+    -- reading this page want gear, so they are hidden by default and this puts
+    -- them back. Same switch the settings pages use, rather than a one-off.
+    local miscToggle = W.Toggle(itemsRow,
+        function() return LunRollHistoryDB and LunRollHistoryDB.settings.mplusShowNonGear end,
+        function(value)
+            LunRollHistoryDB.settings.mplusShowNonGear = value
+            page:Reload()
+        end)
+    miscToggle:SetPoint("TOPRIGHT", -14, -11)
+    itemsRow.miscToggle = miscToggle
+
+    local miscLabel = W.Text(itemsRow, "Show misc items", 11.5, C.textDim)
+    miscLabel:SetPoint("RIGHT", miscToggle, "LEFT", -8, 0)
+    miscLabel:SetJustifyH("RIGHT")
+    itemsRow.miscLabel = miscLabel
+
     itemsRow.hint = W.Text(itemsRow, "", 11, C.textFaint)
-    itemsRow.hint:SetPoint("TOPRIGHT", -14, -12)
+    itemsRow.hint:SetPoint("RIGHT", miscLabel, "LEFT", -12, 0)
     itemsRow.hint:SetJustifyH("RIGHT")
     itemsRow.lines = {}
 
@@ -1017,40 +1041,41 @@ local function CreateMythicPage(parent)
         return line
     end
 
-    -- The journal table is the spine: it lists what can drop, including the
-    -- pieces that never have. Observed counts are laid over it. Anything seen
-    -- drop that the journal does not list is appended rather than dropped, so
-    -- a stale or unmatched journal entry never hides real data.
+    -- Strictly the journal's list for the current loot specialisation, with
+    -- observed counts laid over it. Items seen drop that the journal does not
+    -- list are deliberately not shown: they are off-spec loot that went to
+    -- somebody else, and listing them makes this a record of the group's loot
+    -- rather than a list of what this character can get.
     function itemsRow:Populate(bucket, specID)
         local shown, usedFilter = 0, false
         if bucket then
             local journal, filtered = ns.Mythic:LootTable(bucket.mapID, specID)
             usedFilter = filtered
 
-            local list, seen = {}, {}
+            local showNonGear = LunRollHistoryDB
+                and LunRollHistoryDB.settings.mplusShowNonGear
+            local hidden = 0
+
+            local list = {}
             for _, entry in ipairs(journal) do
+                local gear = ns:IsGearItem(entry.itemID)
+                if not gear and not showNonGear then
+                    hidden = hidden + 1
+                end
                 local observed = bucket.items[entry.itemID]
-                list[#list + 1] = {
-                    itemID = entry.itemID,
-                    name = entry.name,
-                    link = entry.link or (observed and observed.link),
-                    slot = entry.slot,
-                    count = observed and observed.count or 0,
-                    mine = observed and observed.mine or 0,
-                    warbound = observed and observed.warbound or 0,
-                    inJournal = true,
-                }
-                seen[entry.itemID] = true
-            end
-            for _, observed in ipairs(bucket.itemOrder) do
-                if not observed.itemID or not seen[observed.itemID] then
+                if gear or showNonGear then
                     list[#list + 1] = {
-                        itemID = observed.itemID, name = observed.name, link = observed.link,
-                        count = observed.count, mine = observed.mine,
-                        warbound = observed.warbound, inJournal = false,
+                        itemID = entry.itemID,
+                        name = entry.name,
+                        link = entry.link or (observed and observed.link),
+                        slot = entry.slot,
+                        count = observed and observed.count or 0,
+                        mine = observed and observed.mine or 0,
+                        warbound = observed and observed.warbound or 0,
                     }
                 end
             end
+            self.hiddenCount = hidden
 
             table.sort(list, function(a, b)
                 if a.count ~= b.count then return a.count > b.count end
@@ -1079,7 +1104,6 @@ local function CreateMythicPage(parent)
                 if entry.warbound > 0 then
                     detail = (detail ~= "" and (detail .. ", ") or "") .. entry.warbound .. " warbound"
                 end
-                if detail == "" and not entry.inJournal then detail = "not in journal" end
                 line.mine:SetText(detail)
 
                 if entry.count > 0 then
@@ -1109,7 +1133,7 @@ local function CreateMythicPage(parent)
     rows[#rows + 1] = itemsRow
 
     local note = W.Text(body,
-        "The loot table comes from the Encounter Journal filtered to your loot specialisation, with your recorded drops laid over it. Dimmed rows have never dropped for your group. Your share of a run is whatever the chest actually gave the group divided by the party, so no assumption about how many items a run drops is baked in. Great Vault picks are excluded: that is a choice, not luck.",
+        "Runs and items are for this character only. The loot table is the Encounter Journal's list for your current loot specialisation and nothing else, rebuilt when you change spec; dimmed rows have never dropped for your group. Par is whatever the chest actually gave the group divided by the party size, so no assumption about how many items a run drops is baked in. Great Vault picks are excluded: that is a choice, not luck.",
         11, C.textFaint)
     note:SetJustifyH("LEFT")
     note:SetWordWrap(true)
@@ -1143,48 +1167,62 @@ local function CreateMythicPage(parent)
         gridRow:Populate(order)
 
         local specName, specID = ns.Mythic:CurrentSpecName()
-        gridRow.hint:SetText(#order > 0
-            and string.format("%d dungeons this season", #order)
-            or "No season dungeon list available")
+        if #order == 0 then
+            gridRow.hint:SetText("No season dungeon list available")
+        elseif self.selectedMap then
+            gridRow.hint:SetText("Click again to see all dungeons")
+        else
+            gridRow.hint:SetText(string.format("%d dungeons this season", #order))
+        end
 
         local bucket = self.selectedMap and byMap[self.selectedMap]
         local scope = bucket or totals
-        local label = bucket and bucket.name or "All dungeons"
 
         if bucket then
             runsRow.title:SetText("Runs in " .. bucket.name)
+            chestRow.title:SetText("Chest luck in " .. bucket.abbr)
         else
-            runsRow.title:SetText("Runs")
+            runsRow.title:SetText("Runs across all dungeons")
+            chestRow.title:SetText("Chest luck")
         end
 
-        if (scope.runs or 0) == 0 then
+        -- A dungeon with no runs still has a loot table worth seeing: "what can
+        -- drop here" is a fair question before you have ever run it. Only the
+        -- run-derived rows go blank.
+        local hasRuns = (scope.runs or 0) > 0
+        if not hasRuns then
             chestRow:Set("-", nil, "No completed runs recorded here yet.")
             runsRow:Set("", nil, bucket
-                and "Click another dungeon, or run this one."
+                and "Nothing run here yet on this character."
                 or "Complete a Mythic+ dungeon and the chest loot will be recorded automatically.")
-            itemsRow:Populate(nil)
-            itemsRow.empty:SetText("Nothing recorded yet.")
-            itemsRow.empty:Show()
-            self:Layout()
-            return
         end
         itemsRow.empty:Hide()
 
-        if scope.enough and scope.luck then
+        -- Items received out of chests opened, which is the question people
+        -- actually ask. The expected share drives the bar and is stated in
+        -- words rather than shown as a second, confusing number.
+        local value = string.format("%d of %d", scope.mine, scope.runs)
+        if not hasRuns then
+            -- handled above
+        elseif scope.enough and scope.luck then
             local pct = math.floor(scope.luck + 0.5)
-            chestRow:Set(string.format("%d of %.1f", scope.mine, scope.expected), scope.luck,
-                string.format("%s You have taken %d of the %d %s the chest handed out.",
-                    pct >= 50
-                        and string.format("Luckier than %d%% of what chance would give you.", pct)
-                        or string.format("Unluckier than %d%% of what chance would give you.", 100 - pct),
-                    scope.mine, scope.groupItems,
-                    scope.groupItems == 1 and "item" or "items"))
+            chestRow:Set(value, scope.luck, string.format(
+                "%s You opened %d %s and took %d %s. Par is about %.1f.",
+                pct >= 50
+                    and string.format("Luckier than %d%% of what chance would give you.", pct)
+                    or string.format("Unluckier than %d%% of what chance would give you.", 100 - pct),
+                scope.runs, scope.runs == 1 and "chest" or "chests",
+                scope.mine, scope.mine == 1 and "item" or "items",
+                scope.expected))
         else
-            chestRow:Set(string.format("%d of %.1f", scope.mine, scope.expected), nil,
-                string.format("Only %d %s recorded. %d needed before a rating means anything.",
-                    scope.runs, scope.runs == 1 and "run" or "runs", ns.Mythic.MIN_RUNS))
+            chestRow:Set(value, nil, string.format(
+                "You opened %d %s and took %d %s. %d runs needed before a rating means anything.",
+                scope.runs, scope.runs == 1 and "chest" or "chests",
+                scope.mine, scope.mine == 1 and "item" or "items",
+                ns.Mythic.MIN_RUNS))
         end
 
+        if hasRuns then
         local timedPct = (scope.runs > 0) and (scope.timed / scope.runs * 100) or 0
         local runsText = string.format("%d completed, %d timed (%d%%).",
             scope.runs, scope.timed, math.floor(timedPct + 0.5))
@@ -1196,25 +1234,27 @@ local function CreateMythicPage(parent)
                 scope.warbound, scope.warbound == 1 and "drop" or "drops")
         end
         runsRow:Set("", nil, runsText)
+        end
 
         itemsRow.title:SetText("Loot table" .. (bucket and (" - " .. bucket.abbr) or ""))
         if bucket then
             itemsRow:Populate(bucket, specID)
-            if itemsRow.usedFilter and specName then
-                itemsRow.hint:SetText("Filtered to " .. specName)
-            elseif specName then
-                itemsRow.hint:SetText("Journal unavailable, showing observed drops only")
-            else
-                itemsRow.hint:SetText("")
+            itemsRow.miscToggle:Refresh()
+            local hintText = specName and ("Filtered to " .. specName) or ""
+            if (itemsRow.hiddenCount or 0) > 0 then
+                hintText = hintText .. string.format("   %d hidden", itemsRow.hiddenCount)
             end
+            itemsRow.hint:SetText(hintText)
             if (itemsRow.shown or 0) == 0 then
-                itemsRow.empty:SetText("Nothing recorded here, and the journal returned no loot table.")
+                itemsRow.empty:SetText(
+                    "The Encounter Journal returned no loot for this dungeon and specialisation.")
                 itemsRow.empty:Show()
             else
                 itemsRow.empty:Hide()
             end
         else
             itemsRow:Populate(nil)
+            itemsRow.title:SetText("Loot table")
             itemsRow.hint:SetText("")
             itemsRow.empty:SetText("Pick a dungeon above to see its loot table.")
             itemsRow.empty:Show()

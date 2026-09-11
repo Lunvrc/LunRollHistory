@@ -1,30 +1,10 @@
-commit a9a21bcb9d67355f4897f65eeba0b8589f89ac03
-Author: Lun <Lunyaavrc@gmail.com>
-Date:   Wed Sep 9 16:49:40 2026 +0200
+lightweight tag 6b3fb7b099323bf3aa35de2fe9a799b1298ce5a7 1.2.1
+Author:	Lun <LunyaaVRC@gmail.com>
+Date:	Fri Sep 11 03:17:12 2026 +0200
 
-    re-release because i forgot to change the version number :3
+commit 6b3fb7b099323bf3aa35de2fe9a799b1298ce5a7
+Author: Lun <LunyaaVRC@gmail.com>
+Date:   Fri Sep 11 03:17:12 2026 +0200
 
-commit 279d4c0bdf9a4e7918f8ab5ceeff80881ed90c7c
-Author: Lun <Lunyaavrc@gmail.com>
-Date:   Wed Sep 9 16:42:39 2026 +0200
-
-    increased max history sized and added ram clarification.
-
-commit f92d9d13bc640ac07a71e39c40ae3eadb3bee317
-Author: Lun <Lunyaavrc@gmail.com>
-Date:   Wed Sep 9 15:47:27 2026 +0200
-
-    edited readme
-
-commit 9cfe37491a517c759331c44e014077332aadbca4
-Author: Lun <Lunyaavrc@gmail.com>
-Date:   Wed Sep 9 15:37:31 2026 +0200
-
-    first commit
-
-commit 46381fefae96f83d16f74b364f2830324a879220
-Author: Lun <108875000+Lunvrc@users.noreply.github.com>
-Date:   Wed Sep 9 15:15:53 2026 +0200
-
-    Initial commit
+    complete reupload cuz github keeps missing stuff
 

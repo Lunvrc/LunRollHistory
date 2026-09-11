@@ -2,8 +2,8 @@ ignore:
   - .github
   - .gitignore
   - .gitattributes
-  - .tests
+  - tests
   - .git
-  - .tools
+  - tools
   - README.md
   - preview.html

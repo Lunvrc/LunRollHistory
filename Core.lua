@@ -4,7 +4,7 @@
 local ADDON, ns = ...
 
 ns.ADDON        = ADDON
-ns.VERSION      = "1.1.7"
+ns.VERSION      = "1.1.8"
 ns.DB_VERSION   = 1
 ns.MAX_ENTRIES  = 20000     -- oldest entries are pruned past this
 ns.MAX_CAP      = 1000000   -- highest the History size setting allows

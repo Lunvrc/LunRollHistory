@@ -1495,6 +1495,17 @@ local function CreateAppearancePage(parent)
     sizeSlider:SetWidth(200)
     rows[#rows + 1] = sizeRow
 
+    local styleRow = W.SettingRow(body, "Default style map icon",
+        "Uses Blizzard's round tracking border, matching every other addon's button. Fitting the square artwork into a circle crops the top and bottom of it.", 42)
+    local styleToggle = W.Toggle(styleRow,
+        function() return LunRollHistoryDB and LunRollHistoryDB.settings.minimapDefaultStyle end,
+        function(value)
+            LunRollHistoryDB.settings.minimapDefaultStyle = value
+            ns.Minimap:ApplyStyle()
+        end)
+    styleToggle:SetPoint("RIGHT", -14, 0)
+    rows[#rows + 1] = styleRow
+
     local mmRow = W.SettingRow(body, "Show minimap button",
         "Left click opens the window, right click jumps to capture settings.", 42)
     local mmToggle = W.Toggle(mmRow,
@@ -1512,6 +1523,7 @@ local function CreateAppearancePage(parent)
         fontDrop:Refresh()
         sizeSlider:Refresh()
         mmToggle:Refresh()
+        styleToggle:Refresh()
         self:Layout()
     end
 
